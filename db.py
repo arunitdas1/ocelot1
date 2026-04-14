@@ -12,7 +12,7 @@ if not MONGO_URI:
     raise RuntimeError("MONGO_URI is required for MongoDB connection")
 
 _client = MongoClient(MONGO_URI, retryWrites=True)
-db = _client.get_default_database() if _client.get_default_database() else _client["ocelot"]
+db = _client["ocelot"]
 
 citizens = db["citizens"]
 businesses = db["businesses"]
