@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from db import cursor
+from db import active_events, businesses, citizens, loans, market_goods
 from utils import fmt, get_eco_state, get_gov
 
 
@@ -18,23 +18,19 @@ class Indicators(commands.Cog):
         reserves = get_gov("reserves")
         revenue = get_gov("revenue")
 
-        cursor.execute("SELECT COUNT(*) FROM citizens")
-        total_citizens = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM citizens WHERE job_id IS NULL")
-        unemployed_count = cursor.fetchone()[0]
-        cursor.execute("SELECT SUM(cash + bank) FROM citizens")
-        total_wealth_row = cursor.fetchone()
-        total_wealth = total_wealth_row[0] or 0.0
-        cursor.execute("SELECT SUM(cash) FROM businesses WHERE is_bankrupt = 0")
-        biz_wealth_row = cursor.fetchone()
-        biz_wealth = biz_wealth_row[0] or 0.0
+        total_citizens = citizens.count_documents({})
+        unemployed_count = citizens.count_documents({"job_id": None})
+        total_wealth = 0.0
+        for c in citizens.find({}, {"cash": 1, "bank": 1, "_id": 0}):
+            total_wealth += float(c.get("cash") or 0) + float(c.get("bank") or 0)
+        biz_wealth = 0.0
+        for b in businesses.find({"is_bankrupt": 0}, {"cash": 1, "_id": 0}):
+            biz_wealth += float(b.get("cash") or 0)
         gdp = total_wealth + biz_wealth
 
         unemp_rate = (unemployed_count / max(total_citizens, 1)) * 100
-        cursor.execute("SELECT COUNT(*) FROM businesses WHERE is_bankrupt = 0")
-        active_biz = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM active_events WHERE ends_at > strftime('%s', 'now')")
-        active_events = cursor.fetchone()[0]
+        active_biz = businesses.count_documents({"is_bankrupt": 0})
+        active_events_count = active_events.count_documents({"ends_at": {"$gt": int(discord.utils.utcnow().timestamp())}})
 
         phase_emoji = {"boom": "📈", "stable": "📊", "recession": "📉", "depression": "💀"}.get(phase, "📊")
         phase_color = {"boom": discord.Color.green(), "stable": discord.Color.blue(),
@@ -52,7 +48,7 @@ class Indicators(commands.Cog):
         embed.add_field(name="🏢 Active Businesses", value=str(active_biz), inline=True)
         embed.add_field(name="💵 Minimum Wage", value=fmt(min_wage), inline=True)
         embed.add_field(name="🏛️ Gov Reserves", value=fmt(reserves), inline=True)
-        embed.add_field(name="⚡ Active Events", value=str(active_events), inline=True)
+        embed.add_field(name="⚡ Active Events", value=str(active_events_count), inline=True)
 
         if inflation > 0.15:
             embed.add_field(name="⚠️ Warning", value="Hyperinflation risk — prices rising rapidly!", inline=False)
@@ -66,17 +62,22 @@ class Indicators(commands.Cog):
         """View current inflation data and market price trends."""
         inflation = float(get_eco_state("inflation_rate") or 0.02)
 
-        cursor.execute(
-            "SELECT name, current_price, base_price, category FROM market_goods ORDER BY category, name"
+        rows = list(
+            market_goods.find({}, {"name": 1, "current_price": 1, "base_price": 1, "category": 1, "_id": 0}).sort(
+                [("category", 1), ("name", 1)]
+            )
         )
-        rows = cursor.fetchall()
 
         embed = discord.Embed(title="📉 Inflation & Price Report", color=discord.Color.orange())
         embed.add_field(name="Current Inflation Rate", value=f"**{inflation*100:.2f}%**", inline=False)
 
         by_cat = {}
-        for name, curr, base, cat in rows:
-            change_pct = ((curr - base) / base) * 100
+        for row in rows:
+            name = row.get("name")
+            curr = float(row.get("current_price") or 0)
+            base = float(row.get("base_price") or 0)
+            cat = row.get("category")
+            change_pct = ((curr - base) / base) * 100 if abs(base) > 1e-9 else 0.0
             sign = "+" if change_pct >= 0 else ""
             by_cat.setdefault(cat, []).append(f"**{name}**: {fmt(curr)} ({sign}{change_pct:.1f}%)")
 
@@ -90,25 +91,19 @@ class Indicators(commands.Cog):
     @commands.command()
     async def gdp(self, ctx):
         """View the GDP and wealth distribution breakdown."""
-        cursor.execute("SELECT SUM(cash + bank), MAX(cash + bank), MIN(cash + bank), AVG(cash + bank), COUNT(*) FROM citizens")
-        row = cursor.fetchone()
-        total_w, max_w, min_w, avg_w, count = row
-        total_w = total_w or 0
-        max_w = max_w or 0
-        avg_w = avg_w or 0
+        wealth_values = [float(c.get("cash") or 0) + float(c.get("bank") or 0) for c in citizens.find({}, {"cash": 1, "bank": 1, "_id": 0})]
+        count = len(wealth_values)
+        total_w = sum(wealth_values) if wealth_values else 0
+        max_w = max(wealth_values) if wealth_values else 0
+        min_w = min(wealth_values) if wealth_values else 0
+        avg_w = (total_w / count) if count else 0
 
-        cursor.execute("SELECT SUM(cash), COUNT(*) FROM businesses WHERE is_bankrupt = 0")
-        biz_row = cursor.fetchone()
-        biz_total = biz_row[0] or 0
-
-        total_loans = 0
-        cursor.execute("SELECT SUM(remaining) FROM loans WHERE status = 'active'")
-        loan_row = cursor.fetchone()
-        total_loans = loan_row[0] or 0
-
-        cursor.execute("SELECT SUM(shares * share_price) FROM businesses WHERE is_public = 1 AND is_bankrupt = 0")
-        mktcap_row = cursor.fetchone()
-        mkt_cap = mktcap_row[0] or 0
+        biz_total = sum(float(b.get("cash") or 0) for b in businesses.find({"is_bankrupt": 0}, {"cash": 1, "_id": 0}))
+        total_loans = sum(float(l.get("remaining") or 0) for l in loans.find({"status": "active"}, {"remaining": 1, "_id": 0}))
+        mkt_cap = sum(
+            float(b.get("shares") or 0) * float(b.get("share_price") or 0)
+            for b in businesses.find({"is_public": 1, "is_bankrupt": 0}, {"shares": 1, "share_price": 1, "_id": 0})
+        )
 
         embed = discord.Embed(title="📊 GDP & Wealth Distribution", color=discord.Color.blue())
         embed.add_field(name="🌍 Total GDP (Citizens + Business)", value=fmt(total_w + biz_total), inline=False)
@@ -124,15 +119,15 @@ class Indicators(commands.Cog):
     @commands.command()
     async def unemployment(self, ctx):
         """View the unemployment breakdown."""
-        cursor.execute("SELECT COUNT(*) FROM citizens")
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM citizens WHERE job_id IS NOT NULL")
-        employed = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM citizens WHERE job_id IS NULL")
-        unemployed = cursor.fetchone()[0]
+        total = citizens.count_documents({})
+        employed = citizens.count_documents({"job_id": {"$ne": None}})
+        unemployed = citizens.count_documents({"job_id": None})
 
-        cursor.execute("SELECT job_id, COUNT(*) as cnt FROM citizens WHERE job_id IS NOT NULL GROUP BY job_id ORDER BY cnt DESC LIMIT 5")
-        top_jobs = cursor.fetchall()
+        job_counts = {}
+        for c in citizens.find({"job_id": {"$ne": None}}, {"job_id": 1, "_id": 0}):
+            jid = c.get("job_id")
+            job_counts[jid] = job_counts.get(jid, 0) + 1
+        top_jobs = sorted(job_counts.items(), key=lambda item: item[1], reverse=True)[:5]
 
         unemp_rate = (unemployed / max(total, 1)) * 100
         emp_rate = (employed / max(total, 1)) * 100
@@ -152,10 +147,12 @@ class Indicators(commands.Cog):
     @commands.command()
     async def richlist(self, ctx):
         """View the top 10 wealthiest citizens."""
-        cursor.execute(
-            "SELECT user_id, cash + bank AS net_worth FROM citizens ORDER BY net_worth DESC LIMIT 10"
-        )
-        rows = cursor.fetchall()
+        rows = [
+            (c.get("user_id"), float(c.get("cash") or 0) + float(c.get("bank") or 0))
+            for c in citizens.find({}, {"user_id": 1, "cash": 1, "bank": 1, "_id": 0})
+        ]
+        rows.sort(key=lambda r: r[1], reverse=True)
+        rows = rows[:10]
         if not rows:
             await ctx.send("No citizens registered.")
             return
@@ -176,13 +173,21 @@ class Indicators(commands.Cog):
     @commands.command()
     async def markettrends(self, ctx):
         """View market price trends (current vs base price)."""
-        cursor.execute(
-            "SELECT name, current_price, base_price, supply, demand FROM market_goods ORDER BY ABS(current_price - base_price) DESC LIMIT 10"
-        )
-        rows = cursor.fetchall()
+        rows = [
+            (
+                g.get("name"),
+                float(g.get("current_price") or 0),
+                float(g.get("base_price") or 0),
+                g.get("supply"),
+                g.get("demand"),
+            )
+            for g in market_goods.find({}, {"name": 1, "current_price": 1, "base_price": 1, "supply": 1, "demand": 1, "_id": 0})
+        ]
+        rows.sort(key=lambda r: abs(r[1] - r[2]), reverse=True)
+        rows = rows[:10]
         embed = discord.Embed(title="📈 Market Trends (Top Movers)", color=discord.Color.purple())
         for name, curr, base, supply, demand in rows:
-            change = ((curr - base) / base) * 100
+            change = ((curr - base) / base) * 100 if abs(base) > 1e-9 else 0.0
             sign = "+" if change >= 0 else ""
             trend = "📈" if change > 0 else "📉"
             embed.add_field(

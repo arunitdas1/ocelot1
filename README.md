@@ -5,7 +5,7 @@ A deeply realistic, persistent, Discord economy bot that simulates a economy.
 ## Tech Stack
 - **Language:** Python 3.11
 - **Library:** discord.py 2.x
-- **Database:** SQLite (WAL mode, `economy.db`)
+- **Database:** MongoDB (`MONGO_URI`, default DB: `ocelot`)
 - **Prefix:** `!`
 
 ## Architecture — Cogs

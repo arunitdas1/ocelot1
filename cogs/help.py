@@ -171,7 +171,7 @@ class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._catalog_cache = None
-        self._catalog_size = -1
+        self._catalog_signature = None
 
     def classify_command(self, cmd: commands.Command) -> str:
         cog = (cmd.cog_name or "").lower()
@@ -194,13 +194,25 @@ class Help(commands.Cog):
 
     def get_catalog(self):
         visible = [c for c in self.bot.commands if not c.hidden and c.name != "help"]
-        if self._catalog_cache is not None and self._catalog_size == len(visible):
+        signature = tuple(
+            sorted(
+                (
+                    c.qualified_name,
+                    tuple(sorted(c.aliases)),
+                    c.cog_name or "",
+                    bool(c.hidden),
+                    bool(c.enabled),
+                )
+                for c in visible
+            )
+        )
+        if self._catalog_cache is not None and self._catalog_signature == signature:
             return self._catalog_cache
         grouped = {key: [] for key, _ in CATEGORY_ORDER}
         for cmd in sorted(visible, key=lambda c: c.name):
             grouped[self.classify_command(cmd)].append(cmd)
         self._catalog_cache = grouped
-        self._catalog_size = len(visible)
+        self._catalog_signature = signature
         return grouped
 
     def build_home_embed(self, prefix: str, user: discord.abc.User) -> discord.Embed:

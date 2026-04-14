@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import businesses, citizens, portfolios, season_meta, season_stats, write_txn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, add_gov_revenue
 from cogs.business import get_biz
 import math
@@ -11,9 +11,10 @@ MAX_SHARE_TRADE_QTY = 100000
 
 
 def get_portfolio(user_id, biz_id):
-    cursor.execute("SELECT shares, avg_buy_price FROM portfolios WHERE user_id = ? AND biz_id = ?", (user_id, biz_id))
-    row = cursor.fetchone()
-    return row if row else (0, 0.0)
+    row = portfolios.find_one({"user_id": user_id, "biz_id": biz_id}, {"_id": 0, "shares": 1, "avg_buy_price": 1})
+    if not row:
+        return (0, 0.0)
+    return (row.get("shares", 0), row.get("avg_buy_price", 0.0))
 
 
 class Stocks(commands.Cog):
@@ -23,11 +24,12 @@ class Stocks(commands.Cog):
     @commands.command(aliases=["exchange"])
     async def stocks(self, ctx):
         """View all publicly listed companies on the stock exchange."""
-        cursor.execute(
-            "SELECT biz_id, name, type, share_price, shares_issued, revenue, reputation "
-            "FROM businesses WHERE is_public = 1 AND is_bankrupt = 0 ORDER BY share_price DESC"
+        rows = list(
+            businesses.find(
+                {"is_public": 1, "is_bankrupt": 0},
+                {"_id": 0, "biz_id": 1, "name": 1, "type": 1, "share_price": 1, "shares_issued": 1, "revenue": 1, "reputation": 1},
+            ).sort("share_price", -1)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No companies are publicly listed yet. Business owners can use `!ipo` to go public.")
             return
@@ -37,7 +39,13 @@ class Stocks(commands.Cog):
         for idx in range(0, len(rows), chunk_size):
             embed = discord.Embed(title="📈 Stock Exchange", color=discord.Color.green())
             embed.description = "Use `!invest <biz_name> <shares>` to buy stock."
-            for biz_id, name, btype, price, shares, revenue, rep in rows[idx:idx + chunk_size]:
+            for row in rows[idx:idx + chunk_size]:
+                name = row["name"]
+                btype = row["type"]
+                price = row["share_price"]
+                shares = row["shares_issued"]
+                revenue = row["revenue"]
+                rep = row["reputation"]
                 market_cap = price * shares
                 embed.add_field(
                     name=f"{name} ({btype.title()})",
@@ -87,13 +95,14 @@ class Stocks(commands.Cog):
 
         # IPO should not mint money upfront; funds arrive only when shares are sold.
         with write_txn():
-            cursor.execute(
-                "UPDATE businesses SET is_public = 1, shares_issued = ?, share_price = ?, cash = cash - ? WHERE biz_id = ?",
-                (shares, price, ipo_cost, biz["biz_id"])
+            businesses.update_one(
+                {"biz_id": biz["biz_id"]},
+                {"$set": {"is_public": 1, "shares_issued": shares, "share_price": price}, "$inc": {"cash": -ipo_cost}},
             )
-            cursor.execute(
-                "INSERT OR IGNORE INTO portfolios(user_id, biz_id, shares, avg_buy_price) VALUES (?, ?, 0, 0)",
-                (ctx.author.id, biz["biz_id"])
+            portfolios.update_one(
+                {"user_id": ctx.author.id, "biz_id": biz["biz_id"]},
+                {"$setOnInsert": {"user_id": ctx.author.id, "biz_id": biz["biz_id"], "shares": 0, "avg_buy_price": 0.0}},
+                upsert=True,
             )
         await ctx.send(
             f"🎉 **{biz['name']}** has gone public!\n"
@@ -112,7 +121,6 @@ class Stocks(commands.Cog):
             return
 
         ensure_citizen(ctx.author.id)
-        c = get_citizen(ctx.author.id)
         biz = get_biz(name=biz_name)
 
         if not biz:
@@ -125,41 +133,69 @@ class Stocks(commands.Cog):
             await ctx.send("You cannot buy shares of your own company.")
             return
 
-        cursor.execute("SELECT COALESCE(SUM(shares), 0) FROM portfolios WHERE biz_id = ?", (biz["biz_id"],))
-        shares_held = cursor.fetchone()[0]
-        available = biz["shares_issued"] - shares_held
-        if shares > available:
-            await ctx.send(f"Only {available:,} shares available for purchase (of {biz['shares_issued']:,} total issued).")
-            return
-
         total_cost = round(shares * biz["share_price"], 2)
-        if c["cash"] < total_cost:
-            await ctx.send(f"Insufficient funds. Cost: {fmt(total_cost)}. Wallet: {fmt(c['cash'])}.")
-            return
-
-        current_shares, avg_price = get_portfolio(ctx.author.id, biz["biz_id"])
-        new_shares = current_shares + shares
-        new_avg = round(((current_shares * avg_price) + total_cost) / new_shares, 4)
 
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                (total_cost, ctx.author.id, total_cost)
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "cash": {"$gte": total_cost}},
+                {"$inc": {"cash": -total_cost}},
             )
-            if cursor.rowcount == 0:
+            if not debit:
                 latest = get_citizen(ctx.author.id)
                 await ctx.send(f"Insufficient funds. Cost: {fmt(total_cost)}. Wallet: {fmt(latest['cash'])}.")
                 return
-            # IPO share purchases fund the business treasury.
-            cursor.execute("UPDATE businesses SET cash = cash + ? WHERE biz_id = ?", (total_cost, biz["biz_id"]))
-            cursor.execute(
-                "INSERT OR REPLACE INTO portfolios(user_id, biz_id, shares, avg_buy_price) VALUES (?, ?, ?, ?)",
-                (ctx.author.id, biz["biz_id"], new_shares, new_avg)
+            # Enforce issued-share cap atomically at business document level.
+            reserved = businesses.find_one_and_update(
+                {
+                    "biz_id": biz["biz_id"],
+                    "$expr": {
+                        "$gte": [
+                            {"$subtract": ["$shares_issued", {"$ifNull": ["$shares_sold", 0]}]},
+                            int(shares),
+                        ]
+                    },
+                },
+                {"$inc": {"cash": total_cost, "shares_sold": int(shares)}},
             )
-            cursor.execute(
-                "UPDATE businesses SET share_price = share_price * 1.005 WHERE biz_id = ?",
-                (biz["biz_id"],)
+            if not reserved:
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": total_cost}})
+                await ctx.send("Not enough shares available right now. Please try again.")
+                return
+            pf = portfolios.find_one(
+                {"user_id": ctx.author.id, "biz_id": biz["biz_id"]},
+                {"_id": 0, "shares": 1, "avg_buy_price": 1},
             )
+            current_shares = int((pf or {}).get("shares", 0) or 0)
+            avg_price = float((pf or {}).get("avg_buy_price", 0.0) or 0.0)
+            new_shares = current_shares + shares
+            new_avg = round(((current_shares * avg_price) + total_cost) / new_shares, 4)
+            if pf:
+                pf_updated = portfolios.update_one(
+                    {
+                        "user_id": ctx.author.id,
+                        "biz_id": biz["biz_id"],
+                        "shares": current_shares,
+                        "avg_buy_price": avg_price,
+                    },
+                    {"$set": {"shares": new_shares, "avg_buy_price": new_avg}},
+                )
+                if pf_updated.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": total_cost}})
+                    businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"cash": -total_cost, "shares_sold": -int(shares)}})
+                    await ctx.send("Portfolio changed concurrently. Trade was rolled back; try again.")
+                    return
+            else:
+                created = portfolios.update_one(
+                    {"user_id": ctx.author.id, "biz_id": biz["biz_id"]},
+                    {"$setOnInsert": {"user_id": ctx.author.id, "biz_id": biz["biz_id"], "shares": new_shares, "avg_buy_price": new_avg}},
+                    upsert=True,
+                )
+                if created.upserted_id is None and created.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": total_cost}})
+                    businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"cash": -total_cost, "shares_sold": -int(shares)}})
+                    await ctx.send("Portfolio changed concurrently. Trade was rolled back; try again.")
+                    return
+            businesses.update_one({"biz_id": biz["biz_id"]}, {"$mul": {"share_price": 1.005}})
         log_tx(ctx.author.id, "stock_buy", -total_cost, f"Bought {shares} shares of {biz['name']}")
         await ctx.send(
             f"📈 Bought **{shares:,} shares** of **{biz['name']}** at {fmt(biz['share_price'])}/share.\n"
@@ -204,18 +240,37 @@ class Stocks(commands.Cog):
 
         new_shares = current_shares - shares
         with write_txn():
-            if new_shares == 0:
-                cursor.execute("DELETE FROM portfolios WHERE user_id = ? AND biz_id = ?", (ctx.author.id, biz["biz_id"]))
-            else:
-                cursor.execute("UPDATE portfolios SET shares = ? WHERE user_id = ? AND biz_id = ?",
-                               (new_shares, ctx.author.id, biz["biz_id"]))
-
-            cursor.execute("UPDATE businesses SET cash = cash - ? WHERE biz_id = ? AND cash >= ?", (proceeds, biz["biz_id"], proceeds))
-            if cursor.rowcount == 0:
+            paid = businesses.find_one_and_update(
+                {"biz_id": biz["biz_id"], "cash": {"$gte": proceeds}},
+                {"$inc": {"cash": -proceeds, "shares_sold": -int(shares)}},
+            )
+            if not paid:
                 await ctx.send("Sale failed due to concurrent liquidity change. Try again.")
                 return
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (net_proceeds, ctx.author.id))
-            cursor.execute("UPDATE businesses SET share_price = share_price * 0.995 WHERE biz_id = ?", (biz["biz_id"],))
+            sold = portfolios.update_one(
+                {"user_id": ctx.author.id, "biz_id": biz["biz_id"], "shares": {"$gte": int(shares)}},
+                {"$inc": {"shares": -int(shares)}},
+            )
+            if sold.modified_count == 0:
+                businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"cash": proceeds, "shares_sold": int(shares)}})
+                await ctx.send("Sale failed due to concurrent portfolio change. Try again.")
+                return
+            if new_shares == 0:
+                portfolios.delete_one({"user_id": ctx.author.id, "biz_id": biz["biz_id"], "shares": {"$lte": 0}})
+            credited = citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": net_proceeds}})
+            if credited.modified_count == 0:
+                portfolios.update_one(
+                    {"user_id": ctx.author.id, "biz_id": biz["biz_id"]},
+                    {
+                        "$inc": {"shares": int(shares)},
+                        "$setOnInsert": {"user_id": ctx.author.id, "biz_id": biz["biz_id"], "avg_buy_price": avg_price},
+                    },
+                    upsert=True,
+                )
+                businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"cash": proceeds, "shares_sold": int(shares)}})
+                await ctx.send("Sale failed due to concurrent account state change. Try again.")
+                return
+            businesses.update_one({"biz_id": biz["biz_id"]}, {"$mul": {"share_price": 0.995}})
         if capital_gains_tax > 0:
             add_gov_revenue(capital_gains_tax)
         log_tx(ctx.author.id, "stock_sell", net_proceeds, f"Sold {shares} shares of {biz['name']}")
@@ -232,13 +287,29 @@ class Stocks(commands.Cog):
         target = member or ctx.author
         ensure_citizen(target.id)
 
-        cursor.execute(
-            "SELECT p.biz_id, b.name, p.shares, p.avg_buy_price, b.share_price "
-            "FROM portfolios p JOIN businesses b ON p.biz_id = b.biz_id "
-            "WHERE p.user_id = ? AND p.shares > 0",
-            (target.id,)
+        pf_rows = list(
+            portfolios.find(
+                {"user_id": target.id, "shares": {"$gt": 0}},
+                {"_id": 0, "biz_id": 1, "shares": 1, "avg_buy_price": 1},
+            )
         )
-        rows = cursor.fetchall()
+        if not pf_rows:
+            await ctx.send(f"{'Your' if target == ctx.author else target.display_name + chr(39) + 's'} portfolio is empty.")
+            return
+        held_biz_ids = sorted({row["biz_id"] for row in pf_rows})
+        biz_map = {
+            b["biz_id"]: b
+            for b in businesses.find(
+                {"biz_id": {"$in": held_biz_ids}},
+                {"_id": 0, "biz_id": 1, "name": 1, "share_price": 1},
+            )
+        }
+        rows = []
+        for pf in pf_rows:
+            b = biz_map.get(pf["biz_id"])
+            if not b:
+                continue
+            rows.append((pf["biz_id"], b["name"], pf["shares"], pf["avg_buy_price"], b["share_price"]))
         if not rows:
             await ctx.send(f"{'Your' if target == ctx.author else target.display_name + chr(39) + 's'} portfolio is empty.")
             return
@@ -281,22 +352,25 @@ class Stocks(commands.Cog):
     @commands.command(name="seasonstocks")
     async def seasonstocks(self, ctx):
         """Seasonal stock/trade leaderboard."""
-        cursor.execute("SELECT season_id, name FROM season_meta WHERE status = 'active' ORDER BY season_id DESC LIMIT 1")
-        season = cursor.fetchone()
+        season = season_meta.find_one({"status": "active"}, {"_id": 0, "season_id": 1, "name": 1}, sort=[("season_id", -1)])
         if not season:
             await ctx.send("No active season.")
             return
-        season_id, season_name = season
-        cursor.execute(
-            "SELECT user_id, trade_volume FROM season_stats WHERE season_id = ? ORDER BY trade_volume DESC LIMIT 10",
-            (season_id,),
+        season_id = season["season_id"]
+        season_name = season["name"]
+        rows = list(
+            season_stats.find(
+                {"season_id": season_id},
+                {"_id": 0, "user_id": 1, "trade_volume": 1},
+            ).sort("trade_volume", -1).limit(10)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No seasonal trade activity yet.")
             return
         embed = discord.Embed(title=f"📈 {season_name} Trade Ladder", color=discord.Color.green())
-        embed.description = "\n".join([f"**#{i+1}** <@{uid}> — {fmt(vol)} volume" for i, (uid, vol) in enumerate(rows)])
+        embed.description = "\n".join(
+            [f"**#{i+1}** <@{row['user_id']}> — {fmt(row.get('trade_volume', 0))} volume" for i, row in enumerate(rows)]
+        )
         await ctx.send(embed=embed)
 
 

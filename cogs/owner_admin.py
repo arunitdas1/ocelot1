@@ -3,15 +3,13 @@ import gc
 import ast
 import time
 import json
-import shutil
-import sqlite3
 import traceback
 from pathlib import Path
 
 import discord
 from discord.ext import commands
 
-from db import cursor, conn
+from db import admin_audit, active_events, citizens, conn, next_id, transactions
 from utils import ensure_citizen, get_eco_state, set_eco_state, fmt
 
 
@@ -100,11 +98,15 @@ class OwnerAdmin(commands.Cog):
         raise commands.CommandNotFound()
 
     def _audit(self, actor_id: int, action: str, details: str = ""):
-        cursor.execute(
-            "INSERT INTO admin_audit(actor_id, action, details, created_at) VALUES (?, ?, ?, ?)",
-            (actor_id, action, details[:1800], int(time.time())),
+        admin_audit.insert_one(
+            {
+                "audit_id": next_id("admin_audit"),
+                "actor_id": actor_id,
+                "action": action,
+                "details": details[:1800],
+                "created_at": int(time.time()),
+            }
         )
-        conn.commit()
 
     @commands.command(name="ownerpanel", hidden=True)
     async def ownerpanel(self, ctx):
@@ -112,17 +114,17 @@ class OwnerAdmin(commands.Cog):
         guilds = len(self.bot.guilds)
         users = sum((g.member_count or 0) for g in self.bot.guilds)
         latency_ms = round(self.bot.latency * 1000, 2)
-        cursor.execute("SELECT COUNT(*) FROM citizens")
-        citizens = cursor.fetchone()[0]
-        cursor.execute("SELECT COALESCE(SUM(cash + bank), 0) FROM citizens")
-        money = float(cursor.fetchone()[0] or 0.0)
+        citizens_count = citizens.count_documents({})
+        money = 0.0
+        for row in citizens.find({}, {"_id": 0, "cash": 1, "bank": 1}):
+            money += float(row.get("cash", 0.0) or 0.0) + float(row.get("bank", 0.0) or 0.0)
 
         embed = discord.Embed(title="Owner Control Panel", color=discord.Color.dark_gold())
         embed.description = "Private owner dashboard."
         embed.add_field(name="Latency", value=f"{latency_ms}ms", inline=True)
         embed.add_field(name="Servers", value=str(guilds), inline=True)
         embed.add_field(name="Users", value=str(users), inline=True)
-        embed.add_field(name="Citizens", value=str(citizens), inline=True)
+        embed.add_field(name="Citizens", value=str(citizens_count), inline=True)
         embed.add_field(name="Money in circulation", value=fmt(money), inline=True)
         embed.add_field(name="Maintenance", value="ON" if get_eco_state("maintenance_mode") == "1" else "OFF", inline=True)
         embed.set_footer(text="Owner-only controls. All actions are audited.")
@@ -201,8 +203,7 @@ class OwnerAdmin(commands.Cog):
             return
         ensure_citizen(member.id)
         col = "cash" if target == "wallet" else "bank"
-        cursor.execute(f"UPDATE citizens SET {col} = {col} + ? WHERE user_id = ?", (round(amount, 2), member.id))
-        conn.commit()
+        citizens.update_one({"user_id": member.id}, {"$inc": {col: round(amount, 2)}})
         self._audit(ctx.author.id, "owaddcash", f"user={member.id} amount={amount} target={target}")
         await ctx.send(f"✅ Updated {member.mention} {target} by {fmt(amount)}.")
 
@@ -214,8 +215,7 @@ class OwnerAdmin(commands.Cog):
             return
         ensure_citizen(member.id)
         col = "cash" if target == "wallet" else "bank"
-        cursor.execute(f"UPDATE citizens SET {col} = ? WHERE user_id = ?", (round(amount, 2), member.id))
-        conn.commit()
+        citizens.update_one({"user_id": member.id}, {"$set": {col: round(amount, 2)}})
         self._audit(ctx.author.id, "owsetbal", f"user={member.id} amount={amount} target={target}")
         await ctx.send(f"✅ Set {member.mention} {target} to {fmt(amount)}.")
 
@@ -225,13 +225,26 @@ class OwnerAdmin(commands.Cog):
             await ctx.send("Type `CONFIRM` to execute this reset.")
             return
         ensure_citizen(member.id)
-        cursor.execute(
-            "UPDATE citizens SET cash = 1000.0, bank = 0.0, debt = 0.0, credit_score = 650, "
-            "skill_level = 1, education = 'none', happiness = 75.0, job_id = NULL, job_xp = 0, "
-            "last_work = 0, last_daily = 0, housing = 'renting', last_expense = 0 WHERE user_id = ?",
-            (member.id,),
+        citizens.update_one(
+            {"user_id": member.id},
+            {
+                "$set": {
+                    "cash": 1000.0,
+                    "bank": 0.0,
+                    "debt": 0.0,
+                    "credit_score": 650,
+                    "skill_level": 1,
+                    "education": "none",
+                    "happiness": 75.0,
+                    "job_id": None,
+                    "job_xp": 0,
+                    "last_work": 0,
+                    "last_daily": 0,
+                    "housing": "renting",
+                    "last_expense": 0,
+                }
+            },
         )
-        conn.commit()
         self._audit(ctx.author.id, "owresetecon", f"user={member.id}")
         await ctx.send(f"✅ Reset economy profile for {member.mention}.")
 
@@ -240,12 +253,26 @@ class OwnerAdmin(commands.Cog):
         if confirm != "CONFIRM":
             await ctx.send("Type `CONFIRM` to execute global reset.")
             return
-        cursor.execute(
-            "UPDATE citizens SET cash = 1000.0, bank = 0.0, debt = 0.0, credit_score = 650, "
-            "skill_level = 1, education = 'none', happiness = 75.0, job_id = NULL, job_xp = 0, "
-            "last_work = 0, last_daily = 0, housing = 'renting', last_expense = 0"
+        citizens.update_many(
+            {},
+            {
+                "$set": {
+                    "cash": 1000.0,
+                    "bank": 0.0,
+                    "debt": 0.0,
+                    "credit_score": 650,
+                    "skill_level": 1,
+                    "education": "none",
+                    "happiness": 75.0,
+                    "job_id": None,
+                    "job_xp": 0,
+                    "last_work": 0,
+                    "last_daily": 0,
+                    "housing": "renting",
+                    "last_expense": 0,
+                }
+            },
         )
-        conn.commit()
         self._audit(ctx.author.id, "owresetall", "global")
         await ctx.send("✅ Global economy reset completed.")
 
@@ -255,23 +282,22 @@ class OwnerAdmin(commands.Cog):
         if total_amount == 0 or target not in {"wallet", "bank"}:
             await ctx.send("Usage: `!owinject <total_amount> [wallet|bank]` (amount cannot be 0)")
             return
-        cursor.execute("SELECT user_id FROM citizens")
-        users = [r[0] for r in cursor.fetchall()]
+        users = [row.get("user_id") for row in citizens.find({}, {"_id": 0, "user_id": 1}) if row.get("user_id") is not None]
         if not users:
             await ctx.send("No citizens found.")
             return
         share = round(total_amount / len(users), 2)
         col = "cash" if target == "wallet" else "bank"
         for uid in users:
-            cursor.execute(f"UPDATE citizens SET {col} = {col} + ? WHERE user_id = ?", (share, uid))
-        conn.commit()
+            citizens.update_one({"user_id": uid}, {"$inc": {col: share}})
         self._audit(ctx.author.id, "owinject", f"total={total_amount} target={target} users={len(users)}")
         await ctx.send(f"✅ Injected approx {fmt(total_amount)} across {len(users)} users ({fmt(share)} each).")
 
     @commands.command(name="owtotalmoney", hidden=True)
     async def owtotalmoney(self, ctx):
-        cursor.execute("SELECT COALESCE(SUM(cash + bank), 0) FROM citizens")
-        money = float(cursor.fetchone()[0] or 0.0)
+        money = 0.0
+        for row in citizens.find({}, {"_id": 0, "cash": 1, "bank": 1}):
+            money += float(row.get("cash", 0.0) or 0.0) + float(row.get("bank", 0.0) or 0.0)
         await ctx.send(f"✅ Total money in circulation: **{fmt(money)}**.")
 
     # Database control
@@ -284,10 +310,7 @@ class OwnerAdmin(commands.Cog):
     @commands.command(name="owdbraw", hidden=True)
     async def owdbraw(self, ctx, member: discord.Member):
         ensure_citizen(member.id)
-        cursor.execute("SELECT * FROM citizens WHERE user_id = ?", (member.id,))
-        row = cursor.fetchone()
-        cols = [d[0] for d in cursor.description]
-        data = dict(zip(cols, row)) if row else {}
+        data = citizens.find_one({"user_id": member.id}, {"_id": 0}) or {}
         payload = json.dumps(data, indent=2, default=str)[:3900]
         embed = discord.Embed(title=f"Raw User Data: {member}", color=discord.Color.orange())
         embed.description = f"```json\n{payload}\n```"
@@ -298,43 +321,28 @@ class OwnerAdmin(commands.Cog):
         if confirm != "CONFIRM":
             await ctx.send("Type `CONFIRM` to delete the user record.")
             return
-        cursor.execute("DELETE FROM citizens WHERE user_id = ?", (user_id,))
-        conn.commit()
+        citizens.delete_one({"user_id": user_id})
         self._audit(ctx.author.id, "owdbdelete", f"user_id={user_id}")
         await ctx.send("✅ User entry deleted.")
 
     @commands.command(name="owdbbackup", hidden=True)
     async def owdbbackup(self, ctx):
-        ts = int(time.time())
-        target = BACKUP_DIR / f"economy_{ts}.db"
-        # sqlite safe backup API
-        backup_conn = sqlite3.connect(str(target))
-        conn.backup(backup_conn)
-        backup_conn.close()
-        self._audit(ctx.author.id, "owdbbackup", f"path={target}")
-        await ctx.send(f"✅ Backup saved: `{target}`")
+        self._audit(ctx.author.id, "owdbbackup", "mongo_noop")
+        await ctx.send("✅ Mongo mode: SQLite file backup is unavailable here. Use `mongodump` for database backups.")
 
     @commands.command(name="owdbrestore", hidden=True)
     async def owdbrestore(self, ctx, filename: str, confirm: str = ""):
         if confirm != "CONFIRM":
             await ctx.send("Type `CONFIRM` to restore backup.")
             return
-        source = BACKUP_DIR / filename
-        if not source.exists():
-            await ctx.send("Backup file not found.")
-            return
-        # Restore by replacing primary db file (process should be restarted for full safety).
-        conn.commit()
-        shutil.copy2(source, Path("economy.db"))
         self._audit(ctx.author.id, "owdbrestore", f"file={filename}")
-        await ctx.send("✅ Backup file restored to `economy.db`. Restart bot for clean reconnect.")
+        await ctx.send("✅ Mongo mode: SQLite file restore is unavailable. Restore via `mongorestore` from a Mongo backup.")
 
     # Game control
     @commands.command(name="owresetcd", hidden=True)
     async def owresetcd(self, ctx, member: discord.Member):
         ensure_citizen(member.id)
-        cursor.execute("UPDATE citizens SET last_work = 0, last_daily = 0 WHERE user_id = ?", (member.id,))
-        conn.commit()
+        citizens.update_one({"user_id": member.id}, {"$set": {"last_work": 0, "last_daily": 0}})
         self._audit(ctx.author.id, "owresetcd", f"user={member.id}")
         await ctx.send(f"✅ Cooldowns reset for {member.mention}.")
 
@@ -343,8 +351,7 @@ class OwnerAdmin(commands.Cog):
         if confirm != "CONFIRM":
             await ctx.send("Type `CONFIRM` to reset all cooldowns.")
             return
-        cursor.execute("UPDATE citizens SET last_work = 0, last_daily = 0")
-        conn.commit()
+        citizens.update_many({}, {"$set": {"last_work": 0, "last_daily": 0}})
         self._audit(ctx.author.id, "owresetcdall", "all")
         await ctx.send("✅ Cooldowns reset for all users.")
 
@@ -422,16 +429,20 @@ class OwnerAdmin(commands.Cog):
     @commands.command(name="owlogs", hidden=True)
     async def owlogs(self, ctx, limit: int = 20):
         limit = max(1, min(50, limit))
-        cursor.execute(
-            "SELECT actor_id, action, details, created_at FROM admin_audit ORDER BY audit_id DESC LIMIT ?",
-            (limit,),
+        rows = list(
+            admin_audit.find({}, {"_id": 0, "actor_id": 1, "action": 1, "details": 1, "created_at": 1})
+            .sort("audit_id", -1)
+            .limit(limit)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No audit logs yet.")
             return
         lines = []
-        for actor_id, action, details, created_at in rows:
+        for row in rows:
+            actor_id = row.get("actor_id")
+            action = row.get("action")
+            details = row.get("details", "")
+            created_at = row.get("created_at", 0)
             lines.append(f"<t:{int(created_at)}:R> `{action}` by `{actor_id}` {details[:120]}")
         embed = discord.Embed(title="Admin Audit Logs", description="\n".join(lines), color=discord.Color.orange())
         await ctx.send(embed=embed)
@@ -442,23 +453,8 @@ class OwnerAdmin(commands.Cog):
         Owner-only eval/exec.
         WARNING: still powerful; kept hidden and owner-restricted.
         """
-        if os.getenv("ALLOW_OWNER_EVAL", "0") != "1":
-            await ctx.send("Owner eval is disabled. Set `ALLOW_OWNER_EVAL=1` to enable explicitly.")
-            return
-        local_vars = {"bot": self.bot, "ctx": ctx, "cursor": cursor, "conn": conn, "discord": discord}
-        try:
-            if "\n" in code or code.strip().startswith(("for ", "while ", "if ", "def ", "async ")):
-                compiled = compile(code, "<owner-eval>", "exec")
-                exec(compiled, {}, local_vars)
-                result = local_vars.get("result", "OK")
-            else:
-                expr = ast.parse(code, mode="eval")
-                result = eval(compile(expr, "<owner-eval>", "eval"), {}, local_vars)
-            text = str(result)
-            await ctx.send(f"```py\n{text[:3800]}\n```")
-            self._audit(ctx.author.id, "oweval", code[:200])
-        except Exception as e:
-            await ctx.send(f"Eval error:\n```py\n{traceback.format_exc()[:3500]}\n```")
+        await ctx.send("Owner eval is permanently disabled in production-safe mode.")
+        self._audit(ctx.author.id, "oweval_blocked", "disabled")
 
     @commands.command(name="owsim", hidden=True)
     async def owsim(self, ctx, *, command_text: str):
@@ -516,15 +512,13 @@ class OwnerAdmin(commands.Cog):
     @commands.command(name="oweventannounce", hidden=True)
     async def oweventannounce(self, ctx, event_id: int):
         """Broadcast a specific active event."""
-        cursor.execute(
-            "SELECT name, description, ends_at FROM active_events WHERE event_id = ?",
-            (event_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
+        row = active_events.find_one({"event_id": event_id}, {"_id": 0, "name": 1, "description": 1, "ends_at": 1})
+        if row is None:
             await ctx.send("Event not found.")
             return
-        name, description, ends_at = row
+        name = row.get("name")
+        description = row.get("description", "")
+        ends_at = row.get("ends_at", 0)
         sent = 0
         payload = (
             f"🎯 **Limited-Time Event:** {name}\n"
@@ -549,25 +543,33 @@ class OwnerAdmin(commands.Cog):
             await ctx.send("Type `CONFIRM` to rollback transactions.")
             return
         count = max(1, min(100, count))
-        cursor.execute(
-            "SELECT tx_id, user_id, amount FROM transactions ORDER BY tx_id DESC LIMIT ?",
-            (count,),
+        rows = list(
+            transactions.find({}, {"_id": 0, "tx_id": 1, "user_id": 1, "amount": 1})
+            .sort("tx_id", -1)
+            .limit(count)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No transactions to rollback.")
             return
         reversed_count = 0
-        for tx_id, user_id, amount in rows:
+        for row in rows:
+            tx_id = row.get("tx_id")
+            user_id = row.get("user_id")
+            amount = row.get("amount", 0.0)
             ensure_citizen(user_id)
             # Best-effort rollback to wallet cash only (audit-safe, non-destructive to schema).
-            cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (float(amount), user_id))
-            cursor.execute(
-                "INSERT INTO transactions(user_id, tx_type, amount, description, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (user_id, "admin_rollback", -float(amount), f"Rollback of tx_id {tx_id}", int(time.time())),
+            citizens.update_one({"user_id": user_id}, {"$inc": {"cash": -float(amount)}})
+            transactions.insert_one(
+                {
+                    "tx_id": next_id("transactions"),
+                    "user_id": user_id,
+                    "tx_type": "admin_rollback",
+                    "amount": -float(amount),
+                    "description": f"Rollback of tx_id {tx_id}",
+                    "timestamp": int(time.time()),
+                }
             )
             reversed_count += 1
-        conn.commit()
         self._audit(ctx.author.id, "owrollback", f"count={reversed_count}")
         await ctx.send(f"✅ Rolled back {reversed_count} recent transactions.")
 

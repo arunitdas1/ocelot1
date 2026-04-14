@@ -2,7 +2,7 @@ import math
 import time
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import citizens, season_meta, season_stats, transactions, write_txn
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     EDUCATION_LEVELS, calculate_income_tax, housing_expense, get_eco_state
@@ -78,15 +78,19 @@ class Profile(commands.Cog):
         ensure_citizen(member.id)
 
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                (amount, ctx.author.id, amount)
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "cash": {"$gte": amount}},
+                {"$inc": {"cash": -amount}},
             )
-            if cursor.rowcount == 0:
+            if not debit:
                 sender = get_citizen(ctx.author.id)
                 await ctx.send(f"Insufficient funds! You only have {fmt(sender['cash'])} in your wallet.")
                 return
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, member.id))
+            credit = citizens.update_one({"user_id": member.id}, {"$inc": {"cash": amount}})
+            if credit.modified_count == 0:
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": amount}})
+                await ctx.send("Payment failed due to concurrent account state change. No funds were moved.")
+                return
         log_tx(ctx.author.id, "payment_sent", -amount, f"Paid {member.display_name}")
         log_tx(member.id, "payment_received", amount, f"Received from {ctx.author.display_name}")
 
@@ -120,8 +124,20 @@ class Profile(commands.Cog):
 
         amount = round(amount, 2)
         with write_txn():
-            cursor.execute("UPDATE citizens SET cash = cash + ?, last_daily = ? WHERE user_id = ?",
-                           (amount, now, ctx.author.id))
+            claimed = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "last_daily": c["last_daily"]},
+                {"$inc": {"cash": amount}, "$set": {"last_daily": now}},
+            )
+            if not claimed:
+                latest = get_citizen(ctx.author.id)
+                if now - latest["last_daily"] < cooldown:
+                    remaining = cooldown - (now - latest["last_daily"])
+                    h = remaining // 3600
+                    m = (remaining % 3600) // 60
+                    await ctx.send(f"⏳ Daily reward available in **{h}h {m}m**.")
+                    return
+                await ctx.send("Daily claim state changed. Please try again.")
+                return
         log_tx(ctx.author.id, "daily_income", amount, "Daily basic income")
         await ctx.send(f"✅ You claimed your daily income of **{fmt(amount)}**! Come back in 24 hours.")
 
@@ -143,17 +159,24 @@ class Profile(commands.Cog):
     @commands.command()
     async def leaderboard(self, ctx):
         """View the wealth leaderboard."""
-        cursor.execute(
-            "SELECT user_id, cash + bank AS net FROM citizens ORDER BY net DESC LIMIT 10"
+        rows = list(
+            citizens.aggregate(
+                [
+                    {"$project": {"_id": 0, "user_id": 1, "net": {"$add": ["$cash", "$bank"]}}},
+                    {"$sort": {"net": -1}},
+                    {"$limit": 10},
+                ]
+            )
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No citizens registered yet.")
             return
 
         medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
         lines = []
-        for i, (uid, net) in enumerate(rows):
+        for i, row in enumerate(rows):
+            uid = row["user_id"]
+            net = row["net"]
             # Prefer guild/member cache before API call for better latency.
             member = ctx.guild.get_member(uid) if ctx.guild else None
             if member:
@@ -186,23 +209,40 @@ class Profile(commands.Cog):
     @commands.command(name="seasonboard")
     async def seasonboard(self, ctx):
         """View current season standings."""
-        cursor.execute("SELECT season_id, name FROM season_meta WHERE status = 'active' ORDER BY season_id DESC LIMIT 1")
-        season = cursor.fetchone()
+        season = season_meta.find_one({"status": "active"}, {"_id": 0, "season_id": 1, "name": 1}, sort=[("season_id", -1)])
         if not season:
             await ctx.send("No active season.")
             return
-        season_id, season_name = season
-        cursor.execute(
-            "SELECT user_id, net_worth, work_shifts, quests_completed FROM season_stats "
-            "WHERE season_id = ? ORDER BY (net_worth + work_shifts * 50 + quests_completed * 100) DESC LIMIT 10",
-            (season_id,),
+        season_id = season["season_id"]
+        season_name = season["name"]
+        rows = list(
+            season_stats.aggregate(
+                [
+                    {"$match": {"season_id": season_id}},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "user_id": 1,
+                            "net_worth": 1,
+                            "work_shifts": 1,
+                            "quests_completed": 1,
+                            "score": {"$add": ["$net_worth", {"$multiply": ["$work_shifts", 50]}, {"$multiply": ["$quests_completed", 100]}]},
+                        }
+                    },
+                    {"$sort": {"score": -1}},
+                    {"$limit": 10},
+                ]
+            )
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No season activity yet.")
             return
         embed = discord.Embed(title=f"🏁 {season_name} Standings", color=discord.Color.gold())
-        for i, (uid, net, shifts, quests) in enumerate(rows, start=1):
+        for i, row in enumerate(rows, start=1):
+            uid = row["user_id"]
+            net = row.get("net_worth", 0)
+            shifts = row.get("work_shifts", 0)
+            quests = row.get("quests_completed", 0)
             embed.add_field(
                 name=f"#{i} <@{uid}>",
                 value=f"Net: {fmt(net)} | Shifts: {int(shifts)} | Quests: {int(quests)}",
@@ -215,19 +255,22 @@ class Profile(commands.Cog):
         """View your recent transaction history."""
         ensure_citizen(ctx.author.id)
         limit = min(limit, 25)
-        cursor.execute(
-            "SELECT tx_type, amount, description, timestamp FROM transactions "
-            "WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (ctx.author.id, limit)
+        rows = list(
+            transactions.find(
+                {"user_id": ctx.author.id},
+                {"_id": 0, "tx_type": 1, "amount": 1, "description": 1, "timestamp": 1},
+            ).sort("timestamp", -1).limit(limit)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No transactions found.")
             return
 
         import datetime
         lines = []
-        for tx_type, amount, desc, ts in rows:
+        for row in rows:
+            amount = row.get("amount", 0.0)
+            desc = row.get("description", "")
+            ts = row.get("timestamp", 0)
             sign = "+" if amount >= 0 else ""
             dt = datetime.datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
             lines.append(f"`{dt}` {sign}{fmt(amount)} — {desc}")

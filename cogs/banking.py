@@ -2,7 +2,8 @@ import math
 import time
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from pymongo import ReturnDocument
+from db import citizens, loans, next_id, write_txn
 from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
@@ -24,19 +25,19 @@ class Banking(commands.Cog):
         amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                (amount, ctx.author.id, amount)
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "cash": {"$gte": amount}},
+                {"$inc": {"cash": -amount, "bank": amount}},
+                return_document=ReturnDocument.AFTER,
+                projection={"_id": 0, "cash": 1, "bank": 1},
             )
-            if cursor.rowcount == 0:
+            if not debit:
                 c = get_citizen(ctx.author.id)
                 await ctx.send(f"Insufficient cash. Wallet: {fmt(c['cash'])}")
                 return
-            cursor.execute("UPDATE citizens SET bank = bank + ? WHERE user_id = ?", (amount, ctx.author.id))
         ctx._last_deposit_amount = float(amount)
         log_tx(ctx.author.id, "deposit", -amount, "Deposited to bank")
-        c2 = get_citizen(ctx.author.id)
-        await ctx.send(f"🏦 Deposited **{fmt(amount)}** to your bank.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
+        await ctx.send(f"🏦 Deposited **{fmt(amount)}** to your bank.\nWallet: {fmt(debit['cash'])} | Bank: {fmt(debit['bank'])}")
 
     @commands.command(aliases=["wd"])
     async def withdraw(self, ctx, amount: float):
@@ -47,18 +48,18 @@ class Banking(commands.Cog):
         amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET bank = bank - ? WHERE user_id = ? AND bank >= ?",
-                (amount, ctx.author.id, amount)
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "bank": {"$gte": amount}},
+                {"$inc": {"bank": -amount, "cash": amount}},
+                return_document=ReturnDocument.AFTER,
+                projection={"_id": 0, "cash": 1, "bank": 1},
             )
-            if cursor.rowcount == 0:
+            if not debit:
                 c = get_citizen(ctx.author.id)
                 await ctx.send(f"Insufficient bank funds. Bank: {fmt(c['bank'])}")
                 return
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, ctx.author.id))
         log_tx(ctx.author.id, "withdrawal", amount, "Withdrawn from bank")
-        c2 = get_citizen(ctx.author.id)
-        await ctx.send(f"💵 Withdrew **{fmt(amount)}** to your wallet.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
+        await ctx.send(f"💵 Withdrew **{fmt(amount)}** to your wallet.\nWallet: {fmt(debit['cash'])} | Bank: {fmt(debit['bank'])}")
 
     @commands.command(aliases=["borrow"])
     async def loan(self, ctx, amount: float):
@@ -77,8 +78,7 @@ class Banking(commands.Cog):
             await ctx.send(f"Your credit score ({c['credit_score']}) is too low to qualify for a loan. Minimum: 500.")
             return
 
-        cursor.execute("SELECT COUNT(*) FROM loans WHERE borrower_id = ? AND status = 'active'", (ctx.author.id,))
-        active_loans = cursor.fetchone()[0]
+        active_loans = loans.count_documents({"borrower_id": ctx.author.id, "status": "active"})
         if active_loans >= 3:
             await ctx.send("You already have 3 active loans. Repay existing loans before applying for more.")
             return
@@ -102,15 +102,33 @@ class Banking(commands.Cog):
         await ctx.send(embed=embed)
 
         with write_txn():
-            cursor.execute(
-                "INSERT INTO loans(borrower_id, principal, remaining, interest_rate, weekly_payment, issued_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (ctx.author.id, amount, amount, rate, weekly_payment, int(time.time()))
+            post_check = loans.count_documents({"borrower_id": ctx.author.id, "status": "active"})
+            if post_check >= 3:
+                await ctx.send("You already have 3 active loans. Repay existing loans before applying for more.")
+                return
+            loan_id = next_id("loans")
+            loans.insert_one(
+                {
+                    "loan_id": loan_id,
+                    "borrower_id": ctx.author.id,
+                    "principal": amount,
+                    "remaining": amount,
+                    "interest_rate": rate,
+                    "weekly_payment": weekly_payment,
+                    "issued_at": int(time.time()),
+                    "status": "active",
+                    "last_payment": 0,
+                }
             )
-            cursor.execute("UPDATE citizens SET cash = cash + ?, debt = debt + ? WHERE user_id = ?",
-                           (amount, amount, ctx.author.id))
-            cursor.execute("UPDATE citizens SET credit_score = MAX(300, credit_score - 10) WHERE user_id = ?",
-                           (ctx.author.id,))
+            funded = citizens.update_one(
+                {"user_id": ctx.author.id},
+                {"$inc": {"cash": amount, "debt": amount, "credit_score": -10}},
+            )
+            if funded.modified_count == 0:
+                loans.update_one({"loan_id": loan_id, "borrower_id": ctx.author.id, "status": "active"}, {"$set": {"status": "void"}})
+                await ctx.send("Loan disbursement failed due to account state change. Please try again.")
+                return
+            citizens.update_one({"user_id": ctx.author.id}, {"$max": {"credit_score": 300}})
         log_tx(ctx.author.id, "loan_received", amount, f"Loan at {rate*100:.2f}% interest")
         await ctx.send(f"✅ Loan of **{fmt(amount)}** disbursed to your wallet. Repay with `!repay <amount>`.")
 
@@ -126,36 +144,52 @@ class Banking(commands.Cog):
             await ctx.send(f"Not enough cash. Wallet: {fmt(c['cash'])}")
             return
 
-        cursor.execute(
-            "SELECT loan_id, remaining FROM loans WHERE borrower_id = ? AND status = 'active' ORDER BY issued_at ASC LIMIT 1",
-            (ctx.author.id,)
+        loan = loans.find_one(
+            {"borrower_id": ctx.author.id, "status": "active"},
+            {"_id": 0, "loan_id": 1, "remaining": 1},
+            sort=[("issued_at", 1)],
         )
-        loan = cursor.fetchone()
         if not loan:
             await ctx.send("You have no active loans to repay.")
             return
 
-        loan_id, remaining = loan
+        loan_id = loan["loan_id"]
+        remaining = loan["remaining"]
         actual = min(amount, remaining)
         new_remaining = round(remaining - actual, 2)
 
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET cash = cash - ?, debt = MAX(0, debt - ?) WHERE user_id = ? AND cash >= ?",
-                (actual, actual, ctx.author.id, actual),
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "cash": {"$gte": actual}},
+                {"$inc": {"cash": -actual, "debt": -actual}},
             )
-            if cursor.rowcount == 0:
+            if not debit:
                 await ctx.send("Repayment failed due to concurrent balance change. Please try again.")
                 return
+            citizens.update_one({"user_id": ctx.author.id}, {"$max": {"debt": 0}})
             if new_remaining <= 0:
-                cursor.execute("UPDATE loans SET remaining = 0, status = 'paid' WHERE loan_id = ?", (loan_id,))
-                cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 25) WHERE user_id = ?", (ctx.author.id,))
+                closed = loans.update_one(
+                    {"loan_id": loan_id, "status": "active", "remaining": remaining},
+                    {"$set": {"remaining": 0, "status": "paid", "last_payment": int(time.time())}},
+                )
+                if closed.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": actual, "debt": actual}})
+                    await ctx.send("Repayment failed due to concurrent loan change. Please try again.")
+                    return
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"credit_score": 25}})
                 status_msg = f"🎉 Loan fully repaid! Credit score improved."
             else:
-                cursor.execute("UPDATE loans SET remaining = ?, last_payment = ? WHERE loan_id = ?",
-                               (new_remaining, int(time.time()), loan_id))
-                cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 5) WHERE user_id = ?", (ctx.author.id,))
+                paid = loans.update_one(
+                    {"loan_id": loan_id, "status": "active", "remaining": remaining},
+                    {"$set": {"remaining": new_remaining, "last_payment": int(time.time())}},
+                )
+                if paid.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": actual, "debt": actual}})
+                    await ctx.send("Repayment failed due to concurrent loan change. Please try again.")
+                    return
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"credit_score": 5}})
                 status_msg = f"Remaining balance: {fmt(new_remaining)}"
+            citizens.update_one({"user_id": ctx.author.id}, {"$min": {"credit_score": 850}})
         log_tx(ctx.author.id, "loan_repayment", -actual, f"Loan repayment")
         await ctx.send(f"✅ Repaid **{fmt(actual)}**. {status_msg}")
 
@@ -163,12 +197,12 @@ class Banking(commands.Cog):
     async def loans(self, ctx):
         """View all your active loans."""
         ensure_citizen(ctx.author.id)
-        cursor.execute(
-            "SELECT loan_id, principal, remaining, interest_rate, weekly_payment, issued_at FROM loans "
-            "WHERE borrower_id = ? AND status = 'active'",
-            (ctx.author.id,)
+        rows = list(
+            loans.find(
+                {"borrower_id": ctx.author.id, "status": "active"},
+                {"_id": 0, "loan_id": 1, "principal": 1, "remaining": 1, "interest_rate": 1, "weekly_payment": 1, "issued_at": 1},
+            )
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("You have no active loans. 🎉")
             return
@@ -178,7 +212,13 @@ class Banking(commands.Cog):
         chunk_size = 5
         for idx in range(0, len(rows), chunk_size):
             embed = discord.Embed(title="📋 Active Loans", color=discord.Color.red())
-            for loan_id, principal, remaining, rate, weekly, issued in rows[idx:idx + chunk_size]:
+            for loan in rows[idx:idx + chunk_size]:
+                loan_id = loan["loan_id"]
+                principal = loan["principal"]
+                remaining = loan["remaining"]
+                rate = loan["interest_rate"]
+                weekly = loan["weekly_payment"]
+                issued = loan["issued_at"]
                 issued_str = datetime.datetime.fromtimestamp(issued).strftime("%Y-%m-%d")
                 embed.add_field(
                     name=f"Loan #{loan_id} — {fmt(remaining)} remaining",

@@ -3,7 +3,7 @@ from discord.ext import commands
 import math
 import time
 import os
-from db import cursor, write_txn
+from db import citizens, transactions, next_id, write_txn
 from utils import (
     ensure_citizen, get_citizen, fmt,
     get_gov, set_gov, deduct_gov_expense,
@@ -37,10 +37,8 @@ class Government(commands.Cog):
         base_rate = float(get_eco_state("base_interest_rate") or 0.05)
         inflation = float(get_eco_state("inflation_rate") or 0.02)
 
-        cursor.execute("SELECT COUNT(*) FROM citizens")
-        citizens = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM citizens WHERE job_id IS NULL")
-        unemployed = cursor.fetchone()[0]
+        citizens_count = citizens.count_documents({})
+        unemployed = citizens.count_documents({"job_id": None})
 
         embed = discord.Embed(title="🏛️ Government Budget Report", color=discord.Color.red())
         embed.add_field(name="💰 Total Revenue (all-time)", value=fmt(revenue), inline=True)
@@ -50,7 +48,7 @@ class Government(commands.Cog):
         embed.add_field(name="📉 Inflation Rate", value=f"{inflation*100:.2f}%", inline=True)
         embed.add_field(name="🏦 Base Interest Rate", value=f"{base_rate*100:.2f}%", inline=True)
         embed.add_field(name="💵 Minimum Wage", value=fmt(min_wage), inline=True)
-        embed.add_field(name="👥 Citizens", value=str(citizens), inline=True)
+        embed.add_field(name="👥 Citizens", value=str(citizens_count), inline=True)
         embed.add_field(name="🔴 Unemployed", value=str(unemployed), inline=True)
         consumer = clamp(safe_float(get_eco_state("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
         business = clamp(safe_float(get_eco_state("business_confidence") or 0.5, 0.5), 0.0, 1.0)
@@ -90,10 +88,16 @@ class Government(commands.Cog):
         ts = int(time.time())
         with write_txn():
             for uid in all_citizens:
-                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, uid))
-                cursor.execute(
-                    "INSERT INTO transactions(user_id, tx_type, amount, description, timestamp) VALUES (?, ?, ?, ?, ?)",
-                    (uid, "stimulus", amount, "Government stimulus payment", ts)
+                citizens.update_one({"user_id": uid}, {"$inc": {"cash": amount}})
+                transactions.insert_one(
+                    {
+                        "tx_id": next_id("transactions"),
+                        "user_id": uid,
+                        "tx_type": "stimulus",
+                        "amount": amount,
+                        "description": "Government stimulus payment",
+                        "timestamp": ts,
+                    }
                 )
             deduct_gov_expense(total_cost)
         await ctx.send(

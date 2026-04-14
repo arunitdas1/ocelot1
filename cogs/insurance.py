@@ -2,8 +2,9 @@ import math
 import time
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
-from utils import ensure_citizen, get_citizen, fmt, log_tx
+from pymongo.errors import DuplicateKeyError
+from db import citizens, insurance_policies, insurance_claims, next_id, write_txn
+from utils import ensure_citizen, get_citizen, fmt, log_tx, reserve_daily_cap, release_daily_cap
 
 
 INSURANCE_PLANS = {
@@ -46,20 +47,35 @@ class Insurance(commands.Cog):
         c = get_citizen(ctx.author.id)
         p = INSURANCE_PLANS[plan_id]
 
-        cursor.execute(
-            "SELECT COUNT(*) FROM insurance_policies WHERE holder_id = ? AND policy_type = ? AND status = 'active'",
-            (ctx.author.id, plan_id),
+        existing = insurance_policies.count_documents(
+            {"holder_id": ctx.author.id, "policy_type": plan_id, "status": "active"}
         )
-        if cursor.fetchone()[0] > 0:
+        if existing > 0:
             await ctx.send("You already have this plan active.")
             return
 
+        now = int(time.time())
+        policy_id = next_id("insurance_policies")
         with write_txn():
-            cursor.execute(
-                "INSERT INTO insurance_policies(holder_id, policy_type, premium, coverage_limit, deductible, risk_score, started_at, last_billed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ctx.author.id, plan_id, p["premium"], p["limit"], p["deductible"], 1.0, int(time.time()), int(time.time())),
-            )
+            try:
+                insurance_policies.insert_one(
+                    {
+                        "policy_id": policy_id,
+                        "holder_id": ctx.author.id,
+                        "policy_type": plan_id,
+                        "premium": p["premium"],
+                        "coverage_limit": p["limit"],
+                        "deductible": p["deductible"],
+                        "risk_score": 1.0,
+                        "approved_total": 0.0,
+                        "status": "active",
+                        "started_at": now,
+                        "last_billed_at": now,
+                    }
+                )
+            except DuplicateKeyError:
+                await ctx.send("You already have this plan active.")
+                return
 
         embed = discord.Embed(title="Policy activated", color=discord.Color.green())
         embed.description = f"You enrolled in **{p['name']}**.\nPremium: {fmt(p['premium'])}/day"
@@ -69,18 +85,24 @@ class Insurance(commands.Cog):
     async def insurancestatus(self, ctx):
         """View your active insurance policies."""
         ensure_citizen(ctx.author.id)
-        cursor.execute(
-            "SELECT policy_id, policy_type, premium, coverage_limit, deductible, status FROM insurance_policies "
-            "WHERE holder_id = ? ORDER BY policy_id DESC",
-            (ctx.author.id,),
+        rows = list(
+            insurance_policies.find(
+                {"holder_id": ctx.author.id},
+                {"_id": 0, "policy_id": 1, "policy_type": 1, "premium": 1, "coverage_limit": 1, "deductible": 1, "status": 1},
+            ).sort("policy_id", -1)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("You have no insurance policies. Use `!plans`.")
             return
 
         embed = discord.Embed(title=f"{ctx.author.display_name}'s Insurance", color=discord.Color.blue())
-        for policy_id, policy_type, premium, limit_amt, deductible, status in rows[:10]:
+        for row in rows[:10]:
+            policy_id = row.get("policy_id")
+            policy_type = row.get("policy_type")
+            premium = row.get("premium", 0.0)
+            limit_amt = row.get("coverage_limit", 0.0)
+            deductible = row.get("deductible", 0.0)
+            status = row.get("status", "active")
             plan = INSURANCE_PLANS.get(policy_type, {"name": policy_type})
             embed.add_field(
                 name=f"Policy #{policy_id} — {plan['name']}",
@@ -101,43 +123,36 @@ class Insurance(commands.Cog):
 
         ensure_citizen(ctx.author.id)
         now = int(time.time())
-        cursor.execute(
-            "SELECT policy_id, policy_type, coverage_limit, deductible, status, started_at FROM insurance_policies WHERE policy_id = ? AND holder_id = ?",
-            (policy_id, ctx.author.id),
+        row = insurance_policies.find_one(
+            {"policy_id": policy_id, "holder_id": ctx.author.id},
+            {"_id": 0, "policy_id": 1, "policy_type": 1, "coverage_limit": 1, "deductible": 1, "status": 1, "started_at": 1, "approved_total": 1},
         )
-        row = cursor.fetchone()
-        if not row:
+        if row is None:
             await ctx.send("Policy not found.")
             return
 
-        _, policy_type, limit_amt, deductible, status, started_at = row
+        policy_type = row.get("policy_type")
+        limit_amt = row.get("coverage_limit", 0.0)
+        deductible = row.get("deductible", 0.0)
+        status = row.get("status")
+        started_at = row.get("started_at", 0)
         if status != "active":
             await ctx.send("This policy is not active.")
             return
         if now - int(started_at or 0) < MIN_POLICY_AGE_SECONDS:
             await ctx.send("This policy is too new to claim yet. Please wait at least 24 hours from activation.")
             return
-        cursor.execute(
-            "SELECT COUNT(*) FROM insurance_claims WHERE claimant_id = ? AND status = 'approved' AND filed_at >= ?",
-            (ctx.author.id, now - 86400),
+        last_doc = insurance_claims.find_one(
+            {"policy_id": policy_id, "claimant_id": ctx.author.id},
+            {"_id": 0, "filed_at": 1},
+            sort=[("filed_at", -1)],
         )
-        if int(cursor.fetchone()[0] or 0) >= MAX_DAILY_APPROVED_CLAIMS:
-            await ctx.send("You reached your daily approved-claim cap. Try again tomorrow.")
-            return
-        cursor.execute(
-            "SELECT filed_at FROM insurance_claims WHERE policy_id = ? AND claimant_id = ? ORDER BY filed_at DESC LIMIT 1",
-            (policy_id, ctx.author.id),
-        )
-        last_row = cursor.fetchone()
-        if last_row and now - int(last_row[0] or 0) < CLAIM_COOLDOWN_SECONDS:
-            rem = CLAIM_COOLDOWN_SECONDS - (now - int(last_row[0] or 0))
+        last_filed = int((last_doc or {}).get("filed_at", 0) or 0)
+        if last_doc and now - last_filed < CLAIM_COOLDOWN_SECONDS:
+            rem = CLAIM_COOLDOWN_SECONDS - (now - last_filed)
             await ctx.send(f"Claim cooldown active. Try again in {rem // 3600}h {(rem % 3600) // 60}m.")
             return
-        cursor.execute(
-            "SELECT COALESCE(SUM(approved_amount), 0) FROM insurance_claims WHERE policy_id = ? AND claimant_id = ? AND status = 'approved'",
-            (policy_id, ctx.author.id),
-        )
-        approved_so_far = float(cursor.fetchone()[0] or 0.0)
+        approved_so_far = float(row.get("approved_total") or 0.0)
         remaining_coverage = max(0.0, float(limit_amt) - approved_so_far)
         if remaining_coverage <= 0:
             await ctx.send("This policy has exhausted its coverage limit.")
@@ -148,15 +163,46 @@ class Insurance(commands.Cog):
         approved = max(0.0, min(remaining_coverage, claim_amount - float(deductible)))
         approved = round(approved, 2)
 
+        claim_id = next_id("insurance_claims")
         with write_txn():
-            cursor.execute(
-                "INSERT INTO insurance_claims(policy_id, claimant_id, incident_type, claim_amount, approved_amount, status, filed_at, resolved_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (policy_id, ctx.author.id, incident_type.lower(), claim_amount, approved, "approved", now, now),
+            if not reserve_daily_cap(ctx.author.id, "insurance_claim_approved", MAX_DAILY_APPROVED_CLAIMS, now):
+                await ctx.send("You reached your daily approved-claim cap. Try again tomorrow.")
+                return
+            reserve_result = insurance_policies.update_one(
+                {
+                    "policy_id": policy_id,
+                    "holder_id": ctx.author.id,
+                    "status": "active",
+                    "$expr": {"$lte": [{"$add": [{"$ifNull": ["$approved_total", 0]}, approved]}, "$coverage_limit"]},
+                },
+                {"$inc": {"approved_total": approved}},
+            )
+            if reserve_result.modified_count == 0:
+                release_daily_cap(ctx.author.id, "insurance_claim_approved", now)
+                await ctx.send("This policy has exhausted its coverage limit.")
+                return
+            insurance_claims.insert_one(
+                {
+                    "claim_id": claim_id,
+                    "policy_id": policy_id,
+                    "claimant_id": ctx.author.id,
+                    "incident_type": incident_type.lower(),
+                    "claim_amount": claim_amount,
+                    "approved_amount": approved,
+                    "status": "approved",
+                    "filed_at": now,
+                    "resolved_at": now,
+                }
             )
 
             if approved > 0:
-                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (approved, ctx.author.id))
+                credited = citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": approved}})
+                if credited.modified_count == 0:
+                    insurance_claims.delete_one({"claim_id": claim_id, "claimant_id": ctx.author.id})
+                    insurance_policies.update_one({"policy_id": policy_id}, {"$inc": {"approved_total": -approved}})
+                    release_daily_cap(ctx.author.id, "insurance_claim_approved", now)
+                    await ctx.send("Claim payout failed due to concurrent account state change. Please try again.")
+                    return
         if approved > 0:
             log_tx(ctx.author.id, "insurance_claim", approved, f"Insurance claim #{policy_id}")
 
@@ -171,11 +217,11 @@ class Insurance(commands.Cog):
     async def insurancecancel(self, ctx, policy_id: int):
         """Cancel an insurance policy. Usage: !insurancecancel <policy_id>"""
         with write_txn():
-            cursor.execute(
-                "UPDATE insurance_policies SET status = 'cancelled', ends_at = ? WHERE policy_id = ? AND holder_id = ? AND status = 'active'",
-                (int(time.time()), policy_id, ctx.author.id),
+            result = insurance_policies.update_one(
+                {"policy_id": policy_id, "holder_id": ctx.author.id, "status": "active"},
+                {"$set": {"status": "cancelled", "ends_at": int(time.time())}},
             )
-            if cursor.rowcount == 0:
+            if result.modified_count == 0:
                 await ctx.send("No active policy found with that ID.")
                 return
         await ctx.send("✅ Policy cancelled.")

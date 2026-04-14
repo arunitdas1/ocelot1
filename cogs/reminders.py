@@ -1,7 +1,6 @@
 import time
 import discord
 from discord.ext import commands
-from db import cursor
 from utils import ensure_citizen, get_reminder_pref, set_reminder_pref
 
 
@@ -24,7 +23,16 @@ class Reminders(commands.Cog):
     @commands.command()
     async def setreminder(self, ctx, reminder_type: str, state: str):
         ensure_citizen(ctx.author.id)
-        on = 1 if state.lower() in ("on", "true", "1", "yes") else 0
+        state_norm = state.lower().strip()
+        truthy = {"on", "true", "1", "yes"}
+        falsy = {"off", "false", "0", "no"}
+        if state_norm in truthy:
+            on = 1
+        elif state_norm in falsy:
+            on = 0
+        else:
+            await ctx.send("Invalid state. Use on/off.")
+            return
         rt = reminder_type.lower()
         if rt == "dm":
             set_reminder_pref(ctx.author.id, dm_enabled=on)

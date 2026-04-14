@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from db import cursor
+from db import citizens, user_quests
 from utils import ensure_citizen
 
 
@@ -32,11 +32,9 @@ class Onboarding(commands.Cog):
             "- `!trust @user` (market fees and reliability)\n"
         )
         ensure_citizen(ctx.author.id)
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_quests WHERE user_id = ? AND progress >= target AND claimed = 0",
-            (ctx.author.id,),
+        ready_claim = user_quests.count_documents(
+            {"user_id": ctx.author.id, "claimed": 0, "$expr": {"$gte": ["$progress", "$target"]}}
         )
-        ready_claim = int(cursor.fetchone()[0] or 0)
         if ready_claim > 0:
             embed.add_field(name="Ready to claim", value=f"{ready_claim} quest reward(s) ready via `!claimquest <key>`", inline=False)
         embed.add_field(name="Need help?", value="Use `!help` or `!help <command>`", inline=False)
@@ -46,12 +44,15 @@ class Onboarding(commands.Cog):
     async def next_action(self, ctx):
         """Show what you can do right now."""
         ensure_citizen(ctx.author.id)
-        cursor.execute("SELECT COUNT(*) FROM user_quests WHERE user_id = ? AND claimed = 0 AND progress >= target", (ctx.author.id,))
-        claimable = int(cursor.fetchone()[0] or 0)
-        cursor.execute("SELECT COUNT(*) FROM user_quests WHERE user_id = ? AND claimed = 0 AND progress < target", (ctx.author.id,))
-        active = int(cursor.fetchone()[0] or 0)
-        cursor.execute("SELECT last_work, last_daily FROM citizens WHERE user_id = ?", (ctx.author.id,))
-        last_work, last_daily = cursor.fetchone()
+        claimable = user_quests.count_documents(
+            {"user_id": ctx.author.id, "claimed": 0, "$expr": {"$gte": ["$progress", "$target"]}}
+        )
+        active = user_quests.count_documents(
+            {"user_id": ctx.author.id, "claimed": 0, "$expr": {"$lt": ["$progress", "$target"]}}
+        )
+        citizen = citizens.find_one({"user_id": ctx.author.id}, {"last_work": 1, "last_daily": 1, "_id": 0}) or {}
+        last_work = citizen.get("last_work")
+        last_daily = citizen.get("last_daily")
         now = int(discord.utils.utcnow().timestamp())
         work_ready = max(0, 3600 - (now - int(last_work or 0)))
         daily_ready = max(0, 86400 - (now - int(last_daily or 0)))

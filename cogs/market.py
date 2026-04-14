@@ -1,7 +1,7 @@
 import time
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import citizens, inventories, market_goods, market_listings, next_id, write_txn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, get_eco_state, add_gov_revenue, get_trust, clamp
 from cogs.ui_components import PaginatorView, ConfirmView
 
@@ -9,28 +9,24 @@ CATEGORIES = ["food", "materials", "tech", "energy", "luxury"]
 
 
 def get_good(good_id):
-    cursor.execute("SELECT * FROM market_goods WHERE good_id = ?", (good_id,))
-    row = cursor.fetchone()
-    if row:
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
-    return None
+    return market_goods.find_one({"good_id": good_id}, {"_id": 0})
 
 
 def get_inventory(user_id, good_id):
-    cursor.execute("SELECT quantity FROM inventories WHERE user_id = ? AND good_id = ?", (user_id, good_id))
-    row = cursor.fetchone()
-    return row[0] if row else 0
+    row = inventories.find_one({"user_id": user_id, "good_id": good_id}, {"_id": 0, "quantity": 1})
+    return int(row["quantity"]) if row else 0
 
 
 def update_inventory(user_id, good_id, delta):
-    # Single upsert path reduces one read query per inventory update.
-    cursor.execute(
-        "INSERT INTO inventories(user_id, good_id, quantity) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, good_id) DO UPDATE SET quantity = quantity + excluded.quantity",
-        (user_id, good_id, delta),
+    result = inventories.update_one(
+        {"user_id": user_id, "good_id": good_id},
+        {"$inc": {"quantity": delta}, "$setOnInsert": {"user_id": user_id, "good_id": good_id}},
+        upsert=True,
     )
-    cursor.execute("DELETE FROM inventories WHERE user_id = ? AND good_id = ? AND quantity <= 0", (user_id, good_id))
+    if not result.acknowledged:
+        return False
+    inventories.delete_one({"user_id": user_id, "good_id": good_id, "quantity": {"$lte": 0}})
+    return True
 
 
 class Market(commands.Cog):
@@ -44,15 +40,13 @@ class Market(commands.Cog):
             await ctx.send(f"Valid categories: {', '.join(f'`{c}`' for c in CATEGORIES)}")
             return
 
-        query = "SELECT good_id, name, category, current_price, supply, demand FROM market_goods"
-        params = ()
-        if category:
-            query += " WHERE category = ?"
-            params = (category.lower(),)
-        query += " ORDER BY category, name"
-
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        q = {"category": category.lower()} if category else {}
+        rows = list(
+            market_goods.find(
+                q,
+                {"_id": 0, "good_id": 1, "name": 1, "category": 1, "current_price": 1, "supply": 1, "demand": 1},
+            ).sort([("category", 1), ("name", 1)])
+        )
         if not rows:
             await ctx.send("No goods found.")
             return
@@ -65,7 +59,13 @@ class Market(commands.Cog):
         )
 
         by_cat = {}
-        for good_id, name, cat, price, supply, demand in rows:
+        for row in rows:
+            good_id = row["good_id"]
+            name = row["name"]
+            cat = row["category"]
+            price = row["current_price"]
+            supply = row["supply"]
+            demand = row["demand"]
             by_cat.setdefault(cat, []).append((good_id, name, price, supply, demand))
 
         cat_emoji = {"food": "🍞", "materials": "⚙️", "tech": "💻", "energy": "⚡", "luxury": "💎"}
@@ -92,7 +92,6 @@ class Market(commands.Cog):
             return
 
         ensure_citizen(ctx.author.id)
-        c = get_citizen(ctx.author.id)
         good = get_good(good_id)
         if not good:
             await ctx.send(f"Unknown good `{good_id}`. Use `!market` to see available goods.")
@@ -105,32 +104,38 @@ class Market(commands.Cog):
         sales_tax = round(subtotal * 0.08, 2)
         total = round(subtotal + sales_tax, 2)
 
-        if c["cash"] < total:
-            await ctx.send(
-                f"Not enough cash. Total cost: {fmt(total)} ({fmt(subtotal)} + {fmt(sales_tax)} tax). "
-                f"You have {fmt(c['cash'])}."
-            )
-            return
-
         try:
             with write_txn():
-                cursor.execute(
-                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                    (total, ctx.author.id, total)
+                stock = market_goods.find_one_and_update(
+                    {"good_id": good_id, "supply": {"$gte": quantity}},
+                    {"$inc": {"supply": -quantity, "demand": quantity // 2 + 1}},
                 )
-                if cursor.rowcount == 0:
-                    raise RuntimeError("INSUFFICIENT_CASH")
-                cursor.execute(
-                    "UPDATE market_goods SET supply = supply - ?, demand = demand + ? WHERE good_id = ? AND supply >= ?",
-                    (quantity, quantity // 2 + 1, good_id, quantity)
-                )
-                if cursor.rowcount == 0:
+                if not stock:
                     raise RuntimeError("SUPPLY_CHANGED")
-                update_inventory(ctx.author.id, good_id, quantity)
+                debit = citizens.find_one_and_update(
+                    {"user_id": ctx.author.id, "cash": {"$gte": total}},
+                    {"$inc": {"cash": -total}},
+                )
+                if not debit:
+                    market_goods.update_one(
+                        {"good_id": good_id},
+                        {"$inc": {"supply": quantity, "demand": -(quantity // 2 + 1)}},
+                    )
+                    raise RuntimeError("INSUFFICIENT_CASH")
+                inv_ok = update_inventory(ctx.author.id, good_id, quantity)
+                if not inv_ok:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": total}})
+                    market_goods.update_one(
+                        {"good_id": good_id},
+                        {"$inc": {"supply": quantity, "demand": -(quantity // 2 + 1)}},
+                    )
+                    raise RuntimeError("INVENTORY_UPDATE_FAILED")
         except RuntimeError as e:
             if str(e) == "INSUFFICIENT_CASH":
                 latest = get_citizen(ctx.author.id)
                 await ctx.send(f"Not enough cash. Total: {fmt(total)}. Wallet: {fmt(latest['cash'])}.")
+            elif str(e) == "INVENTORY_UPDATE_FAILED":
+                await ctx.send("Purchase failed due to inventory sync error. No funds were moved.")
             else:
                 await ctx.send("Market stock changed while purchasing. Please try again.")
             return
@@ -156,22 +161,40 @@ class Market(commands.Cog):
             await ctx.send(f"Unknown good `{good_id}`. Use `!inventory` to see what you own.")
             return
 
-        owned = get_inventory(ctx.author.id, good_id)
-        if owned < quantity:
-            await ctx.send(f"You only have **{owned}x {good['name']}** in your inventory.")
-            return
-
         max_price = good["current_price"] * 3
         if price > max_price:
             await ctx.send(f"Price too high. Maximum listing price: {fmt(max_price)} (3x market rate).")
             return
 
         with write_txn():
-            update_inventory(ctx.author.id, good_id, -quantity)
-            cursor.execute(
-                "INSERT INTO market_listings(seller_id, good_id, quantity, price_per_unit, listed_at) VALUES (?, ?, ?, ?, ?)",
-                (ctx.author.id, good_id, quantity, price, int(time.time()))
+            reserved = inventories.update_one(
+                {"user_id": ctx.author.id, "good_id": good_id, "quantity": {"$gte": int(quantity)}},
+                {"$inc": {"quantity": -int(quantity)}},
             )
+            if reserved.modified_count == 0:
+                latest_owned = get_inventory(ctx.author.id, good_id)
+                await ctx.send(f"You only have **{latest_owned}x {good['name']}** in your inventory.")
+                return
+            listing_id = next_id("market_listings")
+            inserted = market_listings.insert_one(
+                {
+                    "listing_id": listing_id,
+                    "seller_id": ctx.author.id,
+                    "good_id": good_id,
+                    "quantity": quantity,
+                    "price_per_unit": price,
+                    "listed_at": int(time.time()),
+                }
+            )
+            if not inserted.acknowledged:
+                inventories.update_one(
+                    {"user_id": ctx.author.id, "good_id": good_id},
+                    {"$inc": {"quantity": int(quantity)}, "$setOnInsert": {"user_id": ctx.author.id, "good_id": good_id}},
+                    upsert=True,
+                )
+                await ctx.send("Listing failed due to a concurrent market change. Please try again.")
+                return
+            inventories.delete_one({"user_id": ctx.author.id, "good_id": good_id, "quantity": {"$lte": 0}})
         await ctx.send(
             f"📋 Listed **{quantity}x {good['name']}** at {fmt(price)}/unit. "
             f"Use `!listings` to manage your listings."
@@ -183,16 +206,19 @@ class Market(commands.Cog):
         ensure_citizen(ctx.author.id)
         c = get_citizen(ctx.author.id)
 
-        cursor.execute(
-            "SELECT listing_id, seller_id, good_id, quantity, price_per_unit FROM market_listings WHERE listing_id = ?",
-            (listing_id,)
+        row = market_listings.find_one(
+            {"listing_id": listing_id},
+            {"_id": 0, "listing_id": 1, "seller_id": 1, "good_id": 1, "quantity": 1, "price_per_unit": 1},
         )
-        row = cursor.fetchone()
         if not row:
             await ctx.send("Listing not found.")
             return
 
-        lid, seller_id, good_id, qty, price_per = row
+        lid = row["listing_id"]
+        seller_id = row["seller_id"]
+        good_id = row["good_id"]
+        qty = row["quantity"]
+        price_per = row["price_per_unit"]
         if seller_id == ctx.author.id:
             await ctx.send("You can't buy your own listing!")
             return
@@ -213,21 +239,37 @@ class Market(commands.Cog):
 
         try:
             with write_txn():
-                cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?", (grand, ctx.author.id, grand))
-                if cursor.rowcount == 0:
-                    raise RuntimeError("INSUFFICIENT_CASH")
-                cursor.execute(
-                    "DELETE FROM market_listings WHERE listing_id = ? AND seller_id = ? AND good_id = ? AND quantity = ? AND price_per_unit = ?",
-                    (lid, seller_id, good_id, qty, price_per),
+                removed = market_listings.find_one_and_delete(
+                    {"listing_id": lid, "seller_id": seller_id, "good_id": good_id, "quantity": qty, "price_per_unit": price_per}
                 )
-                if cursor.rowcount == 0:
+                if not removed:
                     raise RuntimeError("LISTING_GONE")
-                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (seller_gets, seller_id))
-                update_inventory(ctx.author.id, good_id, qty)
+                debit = citizens.find_one_and_update(
+                    {"user_id": ctx.author.id, "cash": {"$gte": grand}},
+                    {"$inc": {"cash": -grand}},
+                )
+                if not debit:
+                    market_listings.insert_one(removed)
+                    raise RuntimeError("INSUFFICIENT_CASH")
+                seller_paid = citizens.update_one({"user_id": seller_id}, {"$inc": {"cash": seller_gets}})
+                if seller_paid.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": grand}})
+                    market_listings.insert_one(removed)
+                    raise RuntimeError("SELLER_UNAVAILABLE")
+                inv_ok = update_inventory(ctx.author.id, good_id, qty)
+                if not inv_ok:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": grand}})
+                    citizens.update_one({"user_id": seller_id}, {"$inc": {"cash": -seller_gets}})
+                    market_listings.insert_one(removed)
+                    raise RuntimeError("INVENTORY_UPDATE_FAILED")
         except RuntimeError as e:
             if str(e) == "INSUFFICIENT_CASH":
                 latest = get_citizen(ctx.author.id)
                 await ctx.send(f"Not enough cash. Total: {fmt(grand)}. You have {fmt(latest['cash'])}.")
+            elif str(e) == "SELLER_UNAVAILABLE":
+                await ctx.send("Seller account was unavailable. Transaction was safely rolled back.")
+            elif str(e) == "INVENTORY_UPDATE_FAILED":
+                await ctx.send("Transaction failed due to inventory sync error. No funds were moved.")
             else:
                 await ctx.send("Listing is no longer available. Please try another listing.")
             return
@@ -243,17 +285,36 @@ class Market(commands.Cog):
     @commands.command()
     async def listings(self, ctx, category: str = None):
         """View player market listings. Usage: !listings [category]"""
-        query = (
-            "SELECT ml.listing_id, ml.seller_id, mg.name, ml.quantity, ml.price_per_unit, ml.listed_at "
-            "FROM market_listings ml JOIN market_goods mg ON ml.good_id = mg.good_id"
-        )
         if category:
-            query += " WHERE mg.category = ?"
-            cursor.execute(query, (category.lower(),))
+            goods_q = {"category": category.lower()}
+            goods = {
+                g["good_id"]: g["name"]
+                for g in market_goods.find(goods_q, {"_id": 0, "good_id": 1, "name": 1})
+            }
+            if not goods:
+                await ctx.send("No active player listings.")
+                return
+            rows = list(
+                market_listings.find(
+                    {"good_id": {"$in": list(goods.keys())}},
+                    {"_id": 0, "listing_id": 1, "seller_id": 1, "good_id": 1, "quantity": 1, "price_per_unit": 1, "listed_at": 1},
+                ).sort("listed_at", -1)
+            )
         else:
-            cursor.execute(query)
-
-        rows = cursor.fetchall()
+            rows = list(
+                market_listings.find(
+                    {},
+                    {"_id": 0, "listing_id": 1, "seller_id": 1, "good_id": 1, "quantity": 1, "price_per_unit": 1, "listed_at": 1},
+                ).sort("listed_at", -1)
+            )
+            if not rows:
+                await ctx.send("No active player listings.")
+                return
+            listing_good_ids = sorted({row["good_id"] for row in rows})
+            goods = {
+                g["good_id"]: g["name"]
+                for g in market_goods.find({"good_id": {"$in": listing_good_ids}}, {"_id": 0, "good_id": 1, "name": 1})
+            }
         if not rows:
             await ctx.send("No active player listings.")
             return
@@ -262,7 +323,12 @@ class Market(commands.Cog):
         chunk_size = 8
         for idx in range(0, min(len(rows), 30), chunk_size):
             embed = discord.Embed(title="🏷️ Player Market Listings", color=discord.Color.teal())
-            for lid, seller_id, name, qty, price, listed_at in rows[idx:idx + chunk_size]:
+            for row in rows[idx:idx + chunk_size]:
+                lid = row["listing_id"]
+                seller_id = row["seller_id"]
+                qty = row["quantity"]
+                price = row["price_per_unit"]
+                name = goods.get(row["good_id"], row["good_id"])
                 member = ctx.guild.get_member(seller_id) if ctx.guild else None
                 if member:
                     seller_name = member.display_name
@@ -294,18 +360,30 @@ class Market(commands.Cog):
         """View your inventory."""
         target = member or ctx.author
         ensure_citizen(target.id)
-        cursor.execute(
-            "SELECT i.good_id, mg.name, i.quantity, mg.current_price "
-            "FROM inventories i JOIN market_goods mg ON i.good_id = mg.good_id "
-            "WHERE i.user_id = ? ORDER BY mg.category, mg.name",
-            (target.id,)
-        )
-        rows = cursor.fetchall()
+        inv_rows = list(inventories.find({"user_id": target.id}, {"_id": 0, "good_id": 1, "quantity": 1}))
+        if not inv_rows:
+            await ctx.send(f"{'Your' if target == ctx.author else target.display_name + chr(39) + 's'} inventory is empty.")
+            return
+        inv_good_ids = sorted({inv["good_id"] for inv in inv_rows})
+        goods_map = {
+            g["good_id"]: g
+            for g in market_goods.find(
+                {"good_id": {"$in": inv_good_ids}},
+                {"_id": 0, "good_id": 1, "name": 1, "current_price": 1, "category": 1},
+            )
+        }
+        rows = []
+        for inv in inv_rows:
+            g = goods_map.get(inv["good_id"])
+            if not g:
+                continue
+            rows.append((inv["good_id"], g["name"], inv["quantity"], g["current_price"], g["category"]))
+        rows.sort(key=lambda x: (x[4], x[1]))
         if not rows:
             await ctx.send(f"{'Your' if target == ctx.author else target.display_name + chr(39) + 's'} inventory is empty.")
             return
 
-        total_value = sum(qty * price for _, _, qty, price in rows)
+        total_value = sum(qty * price for _, _, qty, price, _ in rows)
         pages = []
         chunk_size = 8
         for idx in range(0, len(rows), chunk_size):
@@ -314,7 +392,7 @@ class Market(commands.Cog):
                 description=f"Estimated value: **{fmt(total_value)}**",
                 color=discord.Color.green()
             )
-            for good_id, name, qty, price in rows[idx:idx + chunk_size]:
+            for good_id, name, qty, price, _ in rows[idx:idx + chunk_size]:
                 embed.add_field(
                     name=f"{name} (x{qty})",
                     value=f"Market value: {fmt(price * qty)} | `!sell {good_id} {qty} <price>`",
@@ -331,11 +409,10 @@ class Market(commands.Cog):
     @commands.command(aliases=["unlist"])
     async def delist(self, ctx, listing_id: int):
         """Remove one of your active market listings. Usage: !delist <listing_id>"""
-        cursor.execute(
-            "SELECT listing_id, good_id, quantity FROM market_listings WHERE listing_id = ? AND seller_id = ?",
-            (listing_id, ctx.author.id)
+        row = market_listings.find_one(
+            {"listing_id": listing_id, "seller_id": ctx.author.id},
+            {"_id": 0, "listing_id": 1, "good_id": 1, "quantity": 1},
         )
-        row = cursor.fetchone()
         if not row:
             await ctx.send("Listing not found or you don't own it.")
             return
@@ -352,10 +429,15 @@ class Market(commands.Cog):
             await ctx.send("Delist cancelled.")
             return
 
-        lid, good_id, qty = row
+        lid = row["listing_id"]
+        good_id = row["good_id"]
+        qty = row["quantity"]
         with write_txn():
+            removed = market_listings.find_one_and_delete({"listing_id": lid, "seller_id": ctx.author.id})
+            if not removed:
+                await ctx.send("Listing is no longer active.")
+                return
             update_inventory(ctx.author.id, good_id, qty)
-            cursor.execute("DELETE FROM market_listings WHERE listing_id = ?", (lid,))
         good = get_good(good_id)
         await ctx.send(f"✅ Listing #{lid} removed. {qty}x **{good['name']}** returned to your inventory.")
 

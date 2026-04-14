@@ -3,7 +3,7 @@ import random
 import math
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import citizens, offenses, write_txn
 from utils import ensure_citizen, get_citizen, fmt, record_offense
 
 
@@ -49,21 +49,27 @@ class Legal(commands.Cog):
         if caught:
             record_offense(ctx.author.id, offense_type, severity, fine, jail_seconds, detect)
             with write_txn():
-                cursor.execute("UPDATE citizens SET wanted_level = MIN(10, wanted_level + 1), criminal_record_points = criminal_record_points + ? WHERE user_id = ?",
-                               (severity, ctx.author.id))
-                cursor.execute(
-                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                    (fine, ctx.author.id, fine),
+                citizens.update_one(
+                    {"user_id": ctx.author.id},
+                    [
+                        {
+                            "$set": {
+                                "wanted_level": {"$min": [10, {"$add": [{"$ifNull": ["$wanted_level", 0]}, 1]}]},
+                                "criminal_record_points": {"$add": [{"$ifNull": ["$criminal_record_points", 0]}, severity]},
+                            }
+                        }
+                    ],
                 )
-                paid = cursor.rowcount > 0
+                paid_result = citizens.update_one(
+                    {"user_id": ctx.author.id, "cash": {"$gte": fine}},
+                    {"$inc": {"cash": -fine}},
+                )
+                paid = paid_result.modified_count > 0
                 if not paid:
-                    cursor.execute("UPDATE citizens SET debt = debt + ? WHERE user_id = ?", (fine, ctx.author.id))
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"debt": fine}})
                 if jail_seconds > 0:
                     jail_until = int(time.time()) + jail_seconds
-                    cursor.execute(
-                        "UPDATE citizens SET is_jailed = 1, last_release_at = ? WHERE user_id = ?",
-                        (jail_until, ctx.author.id),
-                    )
+                    citizens.update_one({"user_id": ctx.author.id}, {"$set": {"is_jailed": 1, "last_release_at": jail_until}})
             await ctx.send(
                 f"❌ Caught committing **{offense_type}**.\n"
                 f"Fine: {fmt(fine)} ({'paid' if paid else 'added to debt'}) | Jail: {jail_seconds//60} min | Detection: {detect*100:.0f}%"
@@ -71,8 +77,11 @@ class Legal(commands.Cog):
             return
 
         with write_txn():
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (reward, ctx.author.id))
-            cursor.execute("UPDATE citizens SET wanted_level = MAX(0, wanted_level - 1) WHERE user_id = ?", (ctx.author.id,))
+            citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": reward}})
+            citizens.update_one(
+                {"user_id": ctx.author.id},
+                [{"$set": {"wanted_level": {"$max": [0, {"$subtract": [{"$ifNull": ["$wanted_level", 0]}, 1]}]}}}],
+            )
         await ctx.send(f"✅ Crime succeeded: **{offense_type}**. You gained **{fmt(reward)}**. (Detection risk was {detect*100:.0f}%)")
 
     @commands.command(name="record")
@@ -81,11 +90,12 @@ class Legal(commands.Cog):
         target = member or ctx.author
         ensure_citizen(target.id)
         c = get_citizen(target.id)
-        cursor.execute(
-            "SELECT offense_type, severity, fine_amount, jail_seconds, committed_at FROM offenses WHERE offender_id = ? ORDER BY committed_at DESC LIMIT 10",
-            (target.id,),
+        rows = list(
+            offenses.find(
+                {"offender_id": target.id},
+                {"offense_type": 1, "severity": 1, "fine_amount": 1, "jail_seconds": 1, "committed_at": 1, "_id": 0},
+            ).sort("committed_at", -1).limit(10)
         )
-        rows = cursor.fetchall()
         embed = discord.Embed(title=f"Legal Record: {target.display_name}", color=discord.Color.red())
         embed.add_field(name="Wanted Level", value=str(int(c.get("wanted_level") or 0)), inline=True)
         embed.add_field(name="Record Points", value=str(int(c.get("criminal_record_points") or 0)), inline=True)
@@ -94,8 +104,12 @@ class Legal(commands.Cog):
             await ctx.send(embed=embed)
             return
         lines = []
-        for offense_type, severity, fine, jail_s, ts in rows:
-            lines.append(f"<t:{int(ts)}:R> — **{offense_type}** (sev {severity}) fine {fmt(fine)} jail {int(jail_s)//60}m")
+        for row in rows:
+            lines.append(
+                f"<t:{int(row.get('committed_at') or 0)}:R> — **{row.get('offense_type')}** "
+                f"(sev {row.get('severity')}) fine {fmt(float(row.get('fine_amount') or 0))} "
+                f"jail {int(row.get('jail_seconds') or 0)//60}m"
+            )
         embed.description = "\n".join(lines)
         await ctx.send(embed=embed)
 
@@ -111,15 +125,15 @@ class Legal(commands.Cog):
         bail_cost = round(bail_cost, 2)
         if bail_cost > 50000:
             bail_cost = 50000.0
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (bail_cost, ctx.author.id, bail_cost),
+        bail_result = citizens.update_one(
+            {"user_id": ctx.author.id, "cash": {"$gte": bail_cost}},
+            {"$inc": {"cash": -bail_cost}},
         )
-        if cursor.rowcount == 0:
+        if bail_result.modified_count == 0:
             await ctx.send(f"You need {fmt(bail_cost)} cash for bail.")
             return
         with write_txn():
-            cursor.execute("UPDATE citizens SET is_jailed = 0, last_release_at = 0 WHERE user_id = ?", (ctx.author.id,))
+            citizens.update_one({"user_id": ctx.author.id}, {"$set": {"is_jailed": 0, "last_release_at": 0}})
         await ctx.send(f"✅ Bail paid: {fmt(bail_cost)}. You are free.")
 
 

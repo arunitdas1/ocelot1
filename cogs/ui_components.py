@@ -9,7 +9,7 @@ class PaginatorView(discord.ui.View):
     def __init__(self, author_id: int, pages: list[discord.Embed], timeout: float = 120):
         super().__init__(timeout=timeout)
         self.author_id = author_id
-        self.pages = pages
+        self.pages = pages or [make_embed("No Pages", "There is nothing to display right now.", discord.Color.orange())]
         self.index = 0
         self.message = None
         self._sync()
@@ -53,6 +53,7 @@ class ConfirmView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.author_id = author_id
         self.value = None
+        self.message = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -75,4 +76,14 @@ class ConfirmView(discord.ui.View):
             c.disabled = True
         await interaction.response.edit_message(view=self)
         self.stop()
+
+    async def on_timeout(self):
+        self.value = False
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 

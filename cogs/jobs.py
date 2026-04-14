@@ -2,13 +2,13 @@ import time
 import random
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import citizens, write_txn
 from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     calculate_income_tax, get_job_level,
     EDUCATION_LEVELS, EDUCATION_COSTS, EDUCATION_SALARY_BONUS,
-    add_gov_revenue, get_eco_state, safe_float, clamp, record_employment_event
+    add_gov_revenue, get_eco_state, get_eco_states, safe_float, clamp, record_employment_event
 )
 
 JOBS = {
@@ -141,9 +141,9 @@ class Jobs(commands.Cog):
             return
 
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET job_id = ?, job_xp = 0, last_work = 0 WHERE user_id = ?",
-                (job_id, ctx.author.id)
+            citizens.update_one(
+                {"user_id": ctx.author.id},
+                {"$set": {"job_id": job_id, "job_xp": 0, "last_work": 0}},
             )
         await ctx.send(f"✅ You've been hired as a **{j['name']}**! Use `!work` to clock in for your first shift.")
 
@@ -158,8 +158,10 @@ class Jobs(commands.Cog):
 
         job_name = JOBS[c["job_id"]]["name"]
         with write_txn():
-            cursor.execute("UPDATE citizens SET job_id = NULL, job_xp = 0, last_work = 0 WHERE user_id = ?",
-                           (ctx.author.id,))
+            citizens.update_one(
+                {"user_id": ctx.author.id},
+                {"$set": {"job_id": None, "job_xp": 0, "last_work": 0}},
+            )
         await ctx.send(f"You've resigned from **{job_name}**. Your XP has been reset.")
 
     @commands.command()
@@ -184,11 +186,20 @@ class Jobs(commands.Cog):
 
         lvl_num, lvl_title, multiplier, next_xp = get_job_level(c["job_xp"])
         edu_bonus = EDUCATION_SALARY_BONUS.get(c["education"], 1.0)
-        inflation = safe_float(get_eco_state("inflation_rate") or 0.02, 0.02)
-        consumer_conf = clamp(safe_float(get_eco_state("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
-        phase = get_eco_state("economic_phase") or "stable"
-        money_mult = clamp(safe_float(get_eco_state("global_money_multiplier") or 1.0, 1.0), 0.1, 10.0)
-        xp_mult = clamp(safe_float(get_eco_state("global_xp_multiplier") or 1.0, 1.0), 0.1, 10.0)
+        eco = get_eco_states(
+            [
+                "inflation_rate",
+                "consumer_confidence",
+                "economic_phase",
+                "global_money_multiplier",
+                "global_xp_multiplier",
+            ]
+        )
+        inflation = safe_float(eco.get("inflation_rate") or 0.02, 0.02)
+        consumer_conf = clamp(safe_float(eco.get("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
+        phase = eco.get("economic_phase") or "stable"
+        money_mult = clamp(safe_float(eco.get("global_money_multiplier") or 1.0, 1.0), 0.1, 10.0)
+        xp_mult = clamp(safe_float(eco.get("global_xp_multiplier") or 1.0, 1.0), 0.1, 10.0)
 
         gross = random.uniform(j["salary"][0], j["salary"][1])
         # Balanced realism: inflation affects nominal wages modestly; confidence + phase affect hours/bonuses.
@@ -203,10 +214,23 @@ class Jobs(commands.Cog):
         new_xp = c["job_xp"] + int(round(50 * xp_mult))
 
         with write_txn():
-            cursor.execute(
-                "UPDATE citizens SET bank = bank + ?, job_xp = ?, last_work = ? WHERE user_id = ?",
-                (net, new_xp, now, ctx.author.id)
+            paid = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "job_id": c["job_id"], "last_work": c["last_work"]},
+                {"$inc": {"bank": net}, "$set": {"job_xp": new_xp, "last_work": now}},
             )
+            if not paid:
+                latest = get_citizen(ctx.author.id)
+                if latest.get("job_id") != c["job_id"]:
+                    await ctx.send("Your employment changed while working. Please try again.")
+                    return
+                latest_elapsed = now - latest.get("last_work", 0)
+                if latest_elapsed < j["cd"]:
+                    remaining = j["cd"] - latest_elapsed
+                    m, s = divmod(remaining, 60)
+                    await ctx.send(f"⏳ You're still on break. Next shift available in **{m}m {s}s**.")
+                    return
+                await ctx.send("Work state changed. Please try again.")
+                return
         add_gov_revenue(tax)
         log_tx(ctx.author.id, "salary", net, f"{j['name']} shift pay (after tax)")
         record_employment_event(ctx.author.id, "worked", c["job_id"], f"net={net}")
@@ -281,8 +305,17 @@ class Jobs(commands.Cog):
             return
 
         with write_txn():
-            cursor.execute("UPDATE citizens SET cash = cash - ?, education = ? WHERE user_id = ?",
-                           (cost, level, ctx.author.id))
+            upgraded = citizens.update_one(
+                {"user_id": ctx.author.id, "education": c["education"], "cash": {"$gte": cost}},
+                {"$inc": {"cash": -cost}, "$set": {"education": level}},
+            )
+            if upgraded.modified_count == 0:
+                latest = get_citizen(ctx.author.id)
+                if latest["education"] != c["education"]:
+                    await ctx.send(f"You already have **{latest['education'].title()}** or higher education.")
+                else:
+                    await ctx.send(f"You need **{fmt(cost)}** for {level} education. You have {fmt(latest['cash'])}.")
+                return
         log_tx(ctx.author.id, "education", -cost, f"Enrolled in {level} education")
         await ctx.send(
             f"🎓 You've completed **{level.title()}** education! Cost: {fmt(cost)}.\n"
@@ -306,8 +339,17 @@ class Jobs(commands.Cog):
 
         new_skill = c["skill_level"] + 1
         with write_txn():
-            cursor.execute("UPDATE citizens SET cash = cash - ?, skill_level = ? WHERE user_id = ?",
-                           (cost, new_skill, ctx.author.id))
+            trained = citizens.update_one(
+                {"user_id": ctx.author.id, "skill_level": c["skill_level"], "cash": {"$gte": cost}},
+                {"$inc": {"cash": -cost}, "$set": {"skill_level": new_skill}},
+            )
+            if trained.modified_count == 0:
+                latest = get_citizen(ctx.author.id)
+                if latest["skill_level"] != c["skill_level"]:
+                    await ctx.send(f"You've already reached Skill Level **{latest['skill_level']}**.")
+                else:
+                    await ctx.send(f"Training costs **{fmt(cost)}**. You have {fmt(latest['cash'])}.")
+                return
         log_tx(ctx.author.id, "training", -cost, f"Skill training Lv{c['skill_level']} → Lv{new_skill}")
         await ctx.send(
             f"💪 Training complete! Skill Level: **{c['skill_level']} → {new_skill}**.\n"

@@ -1,7 +1,7 @@
 import time
 import discord
 from discord.ext import commands
-from db import cursor
+from db import citizens, transactions
 from utils import ensure_citizen, get_citizen, fmt
 
 
@@ -26,8 +26,7 @@ class Finance(commands.Cog):
         if tier not in valid:
             await ctx.send("Valid tiers: `budget`, `standard`, `premium`, `luxury`.")
             return
-        cursor.execute("UPDATE citizens SET lifestyle_tier = ? WHERE user_id = ?", (tier, ctx.author.id))
-        cursor.connection.commit()
+        citizens.update_one({"user_id": ctx.author.id}, {"$set": {"lifestyle_tier": tier}})
         await ctx.send(f"✅ Lifestyle tier set to **{tier.title()}**.")
 
     @commands.command(name="statement")
@@ -37,19 +36,22 @@ class Finance(commands.Cog):
         days = max(7, min(90, int(days)))
         since = int(time.time()) - days * 86400
 
-        cursor.execute(
-            "SELECT tx_type, SUM(amount) FROM transactions WHERE user_id = ? AND timestamp >= ? GROUP BY tx_type",
-            (ctx.author.id, since),
+        rows = list(
+            transactions.aggregate(
+                [
+                    {"$match": {"user_id": ctx.author.id, "timestamp": {"$gte": since}}},
+                    {"$group": {"_id": "$tx_type", "total": {"$sum": {"$ifNull": ["$amount", 0]}}}},
+                ]
+            )
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No transactions in that period.")
             return
 
         income = 0.0
         expense = 0.0
-        for tx_type, total in rows:
-            total = float(total or 0.0)
+        normalized = [(row.get("_id"), float(row.get("total") or 0.0)) for row in rows]
+        for tx_type, total in normalized:
             if total >= 0:
                 income += total
             else:
@@ -60,7 +62,7 @@ class Finance(commands.Cog):
         embed.add_field(name="Spending", value=fmt(abs(expense)), inline=True)
         embed.add_field(name="Net", value=fmt(income + expense), inline=True)
 
-        top = sorted(rows, key=lambda r: abs(float(r[1] or 0.0)), reverse=True)[:8]
+        top = sorted(normalized, key=lambda r: abs(float(r[1] or 0.0)), reverse=True)[:8]
         lines = []
         for tx_type, total in top:
             total = float(total or 0.0)

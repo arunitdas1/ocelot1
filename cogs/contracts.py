@@ -3,7 +3,7 @@ import json
 import math
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from db import contracts, contract_events, next_id, write_txn
 from utils import ensure_citizen, fmt
 
 
@@ -36,17 +36,34 @@ class Contracts(commands.Cog):
         ensure_citizen(ctx.author.id)
         ensure_citizen(member.id)
 
+        now = _now()
+        contract_id = next_id("contracts")
         terms_json = json.dumps({"text": terms[:1500]})
         with write_txn():
-            cursor.execute(
-                "INSERT INTO contracts(contract_type, party_a_type, party_a_id, party_b_type, party_b_id, terms_json, value, status, created_at, last_event_at) "
-                "VALUES (?, 'citizen', ?, 'citizen', ?, ?, ?, 'draft', ?, ?)",
-                (contract_type.lower(), ctx.author.id, member.id, terms_json, round(value, 2), _now(), _now()),
+            contracts.insert_one(
+                {
+                    "contract_id": contract_id,
+                    "contract_type": contract_type.lower(),
+                    "party_a_type": "citizen",
+                    "party_a_id": ctx.author.id,
+                    "party_b_type": "citizen",
+                    "party_b_id": member.id,
+                    "terms_json": terms_json,
+                    "value": round(value, 2),
+                    "status": "draft",
+                    "signed_by_a": 0,
+                    "signed_by_b": 0,
+                    "created_at": now,
+                    "last_event_at": now,
+                }
             )
-            contract_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (contract_id, "created", json.dumps({"by": ctx.author.id}), _now()),
+            contract_events.insert_one(
+                {
+                    "contract_id": contract_id,
+                    "event_type": "created",
+                    "payload_json": json.dumps({"by": ctx.author.id}),
+                    "created_at": now,
+                }
             )
 
         embed = discord.Embed(title="Contract created", color=discord.Color.green())
@@ -60,15 +77,16 @@ class Contracts(commands.Cog):
     @contract.command(name="sign")
     async def sign(self, ctx, contract_id: int):
         """Sign a draft contract that involves you."""
-        cursor.execute(
-            "SELECT contract_id, party_a_id, party_b_id, status FROM contracts WHERE contract_id = ?",
-            (contract_id,),
+        row = contracts.find_one(
+            {"contract_id": contract_id},
+            {"_id": 0, "contract_id": 1, "party_a_id": 1, "party_b_id": 1, "status": 1, "signed_by_a": 1, "signed_by_b": 1},
         )
-        row = cursor.fetchone()
-        if not row:
+        if row is None:
             await ctx.send("Contract not found.")
             return
-        _, a_id, b_id, status = row
+        a_id = row.get("party_a_id")
+        b_id = row.get("party_b_id")
+        status = row.get("status")
         if ctx.author.id not in (a_id, b_id):
             await ctx.send("You are not a party to this contract.")
             return
@@ -76,33 +94,67 @@ class Contracts(commands.Cog):
             await ctx.send("This contract is not in draft status.")
             return
 
+        now = _now()
+        signer_field = "signed_by_a" if ctx.author.id == a_id else "signed_by_b"
         with write_txn():
-            cursor.execute(
-                "UPDATE contracts SET status = 'active', signed_at = ?, start_at = ?, end_at = ?, last_event_at = ? WHERE contract_id = ?",
-                (_now(), _now(), _now() + 7 * 86400, _now(), contract_id),
+            sign_result = contracts.update_one(
+                {"contract_id": contract_id, "status": "draft", signer_field: {"$ne": 1}},
+                {"$set": {signer_field: 1, "last_event_at": now}},
             )
-            cursor.execute(
-                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (contract_id, "signed", json.dumps({"by": ctx.author.id}), _now()),
+            if sign_result.modified_count == 0:
+                await ctx.send("This contract is not in draft status.")
+                return
+            contract_events.insert_one(
+                {
+                    "contract_id": contract_id,
+                    "event_type": "signed",
+                    "payload_json": json.dumps({"by": ctx.author.id}),
+                    "created_at": now,
+                }
             )
+            signed = contracts.find_one({"contract_id": contract_id}, {"_id": 0, "signed_by_a": 1, "signed_by_b": 1, "status": 1}) or {}
+            if int(signed.get("signed_by_a") or 0) == 1 and int(signed.get("signed_by_b") or 0) == 1 and signed.get("status") == "draft":
+                contracts.update_one(
+                    {"contract_id": contract_id, "status": "draft"},
+                    {
+                        "$set": {
+                            "status": "active",
+                            "signed_at": now,
+                            "start_at": now,
+                            "end_at": now + 7 * 86400,
+                            "last_event_at": now,
+                        }
+                    },
+                )
+                await ctx.send("✅ Contract signed and activated.")
+                return
 
-        await ctx.send("✅ Contract signed and activated.")
+        await ctx.send("✅ Contract signed.")
 
     @contract.command(name="list")
     async def list_contracts(self, ctx):
         """List your contracts."""
-        cursor.execute(
-            "SELECT contract_id, contract_type, party_a_id, party_b_id, value, status, end_at "
-            "FROM contracts WHERE (party_a_id = ? OR party_b_id = ?) ORDER BY contract_id DESC LIMIT 15",
-            (ctx.author.id, ctx.author.id),
+        rows = list(
+            contracts.find(
+                {"$or": [{"party_a_id": ctx.author.id}, {"party_b_id": ctx.author.id}]},
+                {"_id": 0, "contract_id": 1, "contract_type": 1, "party_a_id": 1, "party_b_id": 1, "value": 1, "status": 1, "end_at": 1},
+            )
+            .sort("contract_id", -1)
+            .limit(15)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("You have no contracts.")
             return
 
         embed = discord.Embed(title=f"{ctx.author.display_name}'s Contracts", color=discord.Color.blurple())
-        for cid, ctype, a_id, b_id, value, status, end_at in rows:
+        for row in rows:
+            cid = row.get("contract_id")
+            ctype = row.get("contract_type")
+            a_id = row.get("party_a_id")
+            b_id = row.get("party_b_id")
+            value = row.get("value", 0.0)
+            status = row.get("status", "draft")
+            end_at = int(row.get("end_at", 0) or 0)
             other = b_id if a_id == ctx.author.id else a_id
             embed.add_field(
                 name=f"#{cid} — {ctype} ({status})",
@@ -114,15 +166,16 @@ class Contracts(commands.Cog):
     @contract.command(name="fulfill")
     async def fulfill(self, ctx, contract_id: int):
         """Mark an active contract fulfilled (balanced: mutual honor system with audit trail)."""
-        cursor.execute(
-            "SELECT contract_id, party_a_id, party_b_id, status, terms_json FROM contracts WHERE contract_id = ?",
-            (contract_id,),
+        row = contracts.find_one(
+            {"contract_id": contract_id},
+            {"_id": 0, "contract_id": 1, "party_a_id": 1, "party_b_id": 1, "status": 1, "terms_json": 1},
         )
-        row = cursor.fetchone()
-        if not row:
+        if row is None:
             await ctx.send("Contract not found.")
             return
-        _, a_id, b_id, status, terms_json = row
+        a_id = row.get("party_a_id")
+        b_id = row.get("party_b_id")
+        status = row.get("status")
         if ctx.author.id not in (a_id, b_id):
             await ctx.send("You are not a party to this contract.")
             return
@@ -130,14 +183,19 @@ class Contracts(commands.Cog):
             await ctx.send("Contract is not active.")
             return
 
+        now = _now()
         with write_txn():
-            cursor.execute(
-                "UPDATE contracts SET status = 'fulfilled', last_event_at = ? WHERE contract_id = ?",
-                (_now(), contract_id),
+            contracts.update_one(
+                {"contract_id": contract_id},
+                {"$set": {"status": "fulfilled", "last_event_at": now}},
             )
-            cursor.execute(
-                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (contract_id, "fulfilled", json.dumps({"by": ctx.author.id}), _now()),
+            contract_events.insert_one(
+                {
+                    "contract_id": contract_id,
+                    "event_type": "fulfilled",
+                    "payload_json": json.dumps({"by": ctx.author.id}),
+                    "created_at": now,
+                }
             )
 
         await ctx.send("✅ Contract marked fulfilled.")
@@ -145,27 +203,32 @@ class Contracts(commands.Cog):
     @contract.command(name="dispute")
     async def dispute(self, ctx, contract_id: int, *, reason: str):
         """Open a dispute on a contract (creates a record for admins/social trust impacts)."""
-        cursor.execute(
-            "SELECT contract_id, party_a_id, party_b_id, status FROM contracts WHERE contract_id = ?",
-            (contract_id,),
+        row = contracts.find_one(
+            {"contract_id": contract_id},
+            {"_id": 0, "contract_id": 1, "party_a_id": 1, "party_b_id": 1, "status": 1},
         )
-        row = cursor.fetchone()
-        if not row:
+        if row is None:
             await ctx.send("Contract not found.")
             return
-        _, a_id, b_id, status = row
+        a_id = row.get("party_a_id")
+        b_id = row.get("party_b_id")
         if ctx.author.id not in (a_id, b_id):
             await ctx.send("You are not a party to this contract.")
             return
 
+        now = _now()
         with write_txn():
-            cursor.execute(
-                "UPDATE contracts SET status = 'disputed', last_event_at = ? WHERE contract_id = ?",
-                (_now(), contract_id),
+            contracts.update_one(
+                {"contract_id": contract_id},
+                {"$set": {"status": "disputed", "last_event_at": now}},
             )
-            cursor.execute(
-                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (contract_id, "disputed", json.dumps({"by": ctx.author.id, "reason": reason[:500]}), _now()),
+            contract_events.insert_one(
+                {
+                    "contract_id": contract_id,
+                    "event_type": "disputed",
+                    "payload_json": json.dumps({"by": ctx.author.id, "reason": reason[:500]}),
+                    "created_at": now,
+                }
             )
 
         await ctx.send("✅ Dispute recorded.")

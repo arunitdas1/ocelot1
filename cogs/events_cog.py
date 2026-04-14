@@ -1,9 +1,9 @@
 import time
-import json
+import math
 import discord
 from discord.ext import commands
-from db import cursor
-from utils import fmt, get_eco_state
+from db import active_events
+from utils import get_eco_state, safe_json_loads
 
 
 class EventsCog(commands.Cog, name="Events"):
@@ -14,11 +14,12 @@ class EventsCog(commands.Cog, name="Events"):
     async def view_events(self, ctx):
         """View all active economic events affecting the world."""
         now = int(time.time())
-        cursor.execute(
-            "SELECT name, description, effects, started_at, ends_at FROM active_events WHERE ends_at > ?",
-            (now,)
+        rows = list(
+            active_events.find(
+                {"ends_at": {"$gt": now}},
+                {"name": 1, "description": 1, "effects": 1, "started_at": 1, "ends_at": 1, "_id": 0},
+            )
         )
-        rows = cursor.fetchall()
 
         if not rows:
             await ctx.send("📰 No active economic events right now. The economy is stable.")
@@ -29,11 +30,22 @@ class EventsCog(commands.Cog, name="Events"):
             description="These events are currently affecting the economy.",
             color=discord.Color.dark_orange()
         )
-        for name, desc, effects_json, started, ends in rows:
+        for row in rows:
+            name = row.get("name")
+            desc = row.get("description")
+            effects_json = row.get("effects")
+            ends = row.get("ends_at")
             try:
-                effects = json.loads(effects_json)
+                if isinstance(effects_json, dict):
+                    effects = effects_json
+                else:
+                    effects = safe_json_loads(effects_json, {})
+                if not isinstance(effects, dict):
+                    effects = {}
                 effect_lines = []
                 for k, v in effects.items():
+                    if not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                        continue
                     if k == "price_multiplier":
                         effect_lines.append(f"Market prices ×{v}")
                     elif k == "salary_multiplier":
@@ -65,23 +77,24 @@ class EventsCog(commands.Cog, name="Events"):
     async def event_history(self, ctx):
         """View recent past economic events."""
         now = int(time.time())
-        cursor.execute(
-            "SELECT name, description, started_at, ends_at FROM active_events WHERE ends_at <= ? ORDER BY ends_at DESC LIMIT 5",
-            (now,)
+        rows = list(
+            active_events.find(
+                {"ends_at": {"$lte": now}},
+                {"name": 1, "description": 1, "started_at": 1, "ends_at": 1, "_id": 0},
+            ).sort("ends_at", -1).limit(5)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No past events recorded.")
             return
 
         import datetime
         embed = discord.Embed(title="📜 Recent Economic Events", color=discord.Color.greyple())
-        for name, desc, started, ended in rows:
-            start_str = datetime.datetime.fromtimestamp(started).strftime("%m/%d %H:%M")
-            end_str = datetime.datetime.fromtimestamp(ended).strftime("%m/%d %H:%M")
+        for row in rows:
+            start_str = datetime.datetime.fromtimestamp(int(row.get("started_at") or 0)).strftime("%m/%d %H:%M")
+            end_str = datetime.datetime.fromtimestamp(int(row.get("ends_at") or 0)).strftime("%m/%d %H:%M")
             embed.add_field(
-                name=name,
-                value=f"{desc}\n{start_str} → {end_str}",
+                name=row.get("name"),
+                value=f"{row.get('description')}\n{start_str} → {end_str}",
                 inline=False
             )
         await ctx.send(embed=embed)

@@ -1,10 +1,10 @@
 import re
-import sqlite3
 import time
 import math
 import discord
 from discord.ext import commands
-from db import cursor, write_txn
+from pymongo.errors import DuplicateKeyError
+from db import businesses, citizens, next_id, write_txn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, add_gov_revenue
 from utils import clamp, add_reputation
 from cogs.ui_components import PaginatorView, ConfirmView
@@ -25,15 +25,21 @@ MAX_BIZ_TRANSFER = 1_000_000.0
 
 def get_biz(biz_id=None, owner_id=None, name=None):
     if biz_id:
-        cursor.execute("SELECT * FROM businesses WHERE biz_id = ?", (biz_id,))
+        return businesses.find_one({"biz_id": biz_id}, {"_id": 0})
     elif owner_id:
-        cursor.execute("SELECT * FROM businesses WHERE owner_id = ? AND is_bankrupt = 0 LIMIT 1", (owner_id,))
+        return businesses.find_one({"owner_id": owner_id, "is_bankrupt": 0}, {"_id": 0})
     elif name:
-        cursor.execute("SELECT * FROM businesses WHERE LOWER(name) = LOWER(?) AND is_bankrupt = 0", (name,))
-    row = cursor.fetchone()
-    if row:
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+        name_lc = str(name).strip().lower()
+        return businesses.find_one(
+            {
+                "is_bankrupt": 0,
+                "$or": [
+                    {"name_lc": name_lc},
+                    {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
+                ],
+            },
+            {"_id": 0},
+        )
     return None
 
 
@@ -75,31 +81,54 @@ class Business(commands.Cog):
         if existing:
             await ctx.send(f"You already own **{existing['name']}**. You can only own one business.")
             return
+        if get_biz(name=name):
+            await ctx.send("Business name is already taken. Please choose another name.")
+            return
 
         cost = BIZ_TYPES[btype]["cost"]
         if c["cash"] < cost:
             await ctx.send(f"You need {fmt(cost)} to start a {BIZ_TYPES[btype]['name']}. You have {fmt(c['cash'])}.")
             return
 
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (cost, ctx.author.id, cost),
-        )
-        if cursor.rowcount == 0:
-            latest = get_citizen(ctx.author.id)
-            await ctx.send(f"You need {fmt(cost)} to start a {BIZ_TYPES[btype]['name']}. You have {fmt(latest['cash'])}.")
-            return
-        try:
-            with write_txn():
-                cursor.execute(
-                    "INSERT INTO businesses(owner_id, name, type, founded_at) VALUES (?, ?, ?, ?)",
-                    (ctx.author.id, name, btype, int(time.time()))
+        with write_txn():
+            debit = citizens.find_one_and_update(
+                {"user_id": ctx.author.id, "cash": {"$gte": cost}},
+                {"$inc": {"cash": -cost}},
+            )
+            if not debit:
+                latest = get_citizen(ctx.author.id)
+                await ctx.send(f"You need {fmt(cost)} to start a {BIZ_TYPES[btype]['name']}. You have {fmt(latest['cash'])}.")
+                return
+            try:
+                inserted = businesses.insert_one(
+                    {
+                        "biz_id": next_id("businesses"),
+                        "owner_id": ctx.author.id,
+                        "name": name,
+                        "name_lc": name.lower(),
+                        "type": btype,
+                        "founded_at": int(time.time()),
+                        "cash": 0.0,
+                        "revenue": 0.0,
+                        "expenses": 0.0,
+                        "reputation": 50.0,
+                        "employees": 0,
+                        "is_public": 0,
+                        "shares_issued": 0,
+                        "share_price": 0.0,
+                        "is_bankrupt": 0,
+                    }
                 )
-        except sqlite3.IntegrityError:
-            with write_txn():
-                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (cost, ctx.author.id))
-            await ctx.send("Business name is already taken. Please choose another name.")
-            return
+            except DuplicateKeyError:
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": cost}})
+                await ctx.send("You already own an active business or this business name is taken.")
+                return
+            if inserted.acknowledged:
+                pass
+            else:
+                citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": cost}})
+                await ctx.send("Business name is already taken. Please choose another name.")
+                return
         log_tx(ctx.author.id, "biz_startup", -cost, f"Founded {name}")
         await ctx.send(
             f"🏢 **{name}** ({BIZ_TYPES[btype]['name']}) has been founded!\n"
@@ -159,13 +188,14 @@ class Business(commands.Cog):
         rep_delta = clamp(0.5 + employees * 0.01, 0.5, 2.0)
         try:
             with write_txn():
-                cursor.execute(
-                    "UPDATE businesses SET cash = cash - ?, expenses = expenses + ? WHERE biz_id = ? AND cash >= ?",
-                    (total, total, biz["biz_id"], total),
+                paid = businesses.find_one_and_update(
+                    {"biz_id": biz["biz_id"], "cash": {"$gte": total}},
+                    {"$inc": {"cash": -total, "expenses": total}},
                 )
-                if cursor.rowcount == 0:
+                if not paid:
                     raise RuntimeError("INSUFFICIENT_BIZ_CASH")
-                cursor.execute("UPDATE businesses SET reputation = MIN(100, reputation + ?) WHERE biz_id = ?", (rep_delta, biz["biz_id"]))
+                businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"reputation": rep_delta}})
+                businesses.update_one({"biz_id": biz["biz_id"]}, {"$min": {"reputation": 100}})
         except RuntimeError:
             await ctx.send(f"Insufficient business reserves for ops. Needed: {fmt(total)}.")
             return
@@ -194,15 +224,18 @@ class Business(commands.Cog):
             return
         try:
             with write_txn():
-                cursor.execute(
-                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                    (amount, ctx.author.id, amount),
+                debit = citizens.find_one_and_update(
+                    {"user_id": ctx.author.id, "cash": {"$gte": amount}},
+                    {"$inc": {"cash": -amount}},
                 )
-                if cursor.rowcount == 0:
+                if not debit:
                     raise RuntimeError("INSUFFICIENT_CASH")
-                cursor.execute("UPDATE businesses SET cash = cash + ? WHERE biz_id = ?", (amount, biz["biz_id"]))
+                credited = businesses.update_one({"biz_id": biz["biz_id"], "is_bankrupt": 0}, {"$inc": {"cash": amount}})
+                if credited.modified_count == 0:
+                    citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": amount}})
+                    raise RuntimeError("BIZ_UNAVAILABLE")
         except RuntimeError:
-            await ctx.send("Insufficient cash due to concurrent balance change.")
+            await ctx.send("Business deposit failed due to concurrent state change.")
             return
         log_tx(ctx.author.id, "biz_deposit", -amount, f"Injected into {biz['name']}")
         await ctx.send(f"✅ Deposited {fmt(amount)} into **{biz['name']}**.")
@@ -230,13 +263,16 @@ class Business(commands.Cog):
         net = round(amount - corp_tax, 2)
         try:
             with write_txn():
-                cursor.execute(
-                    "UPDATE businesses SET cash = cash - ? WHERE biz_id = ? AND cash >= ?",
-                    (amount, biz["biz_id"], amount),
+                debit = businesses.find_one_and_update(
+                    {"biz_id": biz["biz_id"], "cash": {"$gte": amount}},
+                    {"$inc": {"cash": -amount}},
                 )
-                if cursor.rowcount == 0:
+                if not debit:
                     raise RuntimeError("INSUFFICIENT_BIZ_CASH")
-                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (net, ctx.author.id))
+                credited = citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": net}})
+                if credited.modified_count == 0:
+                    businesses.update_one({"biz_id": biz["biz_id"]}, {"$inc": {"cash": amount}})
+                    raise RuntimeError("USER_UNAVAILABLE")
         except RuntimeError:
             await ctx.send("Business reserves changed; withdrawal cancelled.")
             return
@@ -259,14 +295,21 @@ class Business(commands.Cog):
             await ctx.send(f"You need at least {fmt(EMPLOYEE_COST * 2)} in business reserves to hire.")
             return
 
-        new_count = biz["employees"] + 1
-        revenue_boost = round(biz["revenue"] + (EMPLOYEE_COST * 0.5), 2)
-        new_expenses = round(biz["expenses"] + EMPLOYEE_COST, 2)
         with write_txn():
-            cursor.execute(
-                "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
-                (new_count, revenue_boost, new_expenses, biz["biz_id"])
+            hired = businesses.update_one(
+                {"biz_id": biz["biz_id"], "employees": biz["employees"], "cash": {"$gte": EMPLOYEE_COST * 2}},
+                {"$inc": {"employees": 1, "revenue": round(EMPLOYEE_COST * 0.5, 2), "expenses": EMPLOYEE_COST}},
             )
+            if hired.modified_count == 0:
+                latest = get_biz(biz_id=biz["biz_id"])
+                if not latest:
+                    await ctx.send("Business no longer available.")
+                elif latest["employees"] >= MAX_EMPLOYEES:
+                    await ctx.send(f"You've reached the maximum of {MAX_EMPLOYEES} employees.")
+                else:
+                    await ctx.send(f"You need at least {fmt(EMPLOYEE_COST * 2)} in business reserves to hire.")
+                return
+        new_count = biz["employees"] + 1
         await ctx.send(
             f"✅ Hired employee #{new_count} for **{biz['name']}**.\n"
             f"Cost: {fmt(EMPLOYEE_COST)}/cycle | Estimated revenue boost: +{fmt(EMPLOYEE_COST * 0.5)}/cycle"
@@ -284,24 +327,31 @@ class Business(commands.Cog):
             await ctx.send("You have no employees to fire.")
             return
 
-        new_count = biz["employees"] - 1
-        revenue_cut = round(biz["revenue"] - (EMPLOYEE_COST * 0.5), 2)
-        new_expenses = round(biz["expenses"] - EMPLOYEE_COST, 2)
         with write_txn():
-            cursor.execute(
-                "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
-                (new_count, max(0, revenue_cut), max(0, new_expenses), biz["biz_id"])
+            fired = businesses.update_one(
+                {"biz_id": biz["biz_id"], "employees": biz["employees"]},
+                {"$inc": {"employees": -1, "revenue": -round(EMPLOYEE_COST * 0.5, 2), "expenses": -EMPLOYEE_COST}},
             )
+            if fired.modified_count == 0:
+                latest = get_biz(biz_id=biz["biz_id"])
+                if not latest or latest["employees"] <= 0:
+                    await ctx.send("You have no employees to fire.")
+                else:
+                    await ctx.send("Employee count changed concurrently. Please try again.")
+                return
+            businesses.update_one({"biz_id": biz["biz_id"]}, {"$max": {"revenue": 0.0, "expenses": 0.0}})
+        new_count = biz["employees"] - 1
         await ctx.send(f"Employee laid off. **{biz['name']}** now has {new_count} employees.")
 
     @commands.command(aliases=["businesses"])
     async def bizlist(self, ctx):
         """View all active businesses."""
-        cursor.execute(
-            "SELECT biz_id, name, type, employees, reputation, cash, is_public FROM businesses "
-            "WHERE is_bankrupt = 0 ORDER BY cash DESC LIMIT 15"
+        rows = list(
+            businesses.find(
+                {"is_bankrupt": 0},
+                {"_id": 0, "biz_id": 1, "name": 1, "type": 1, "employees": 1, "reputation": 1, "cash": 1, "is_public": 1},
+            ).sort("cash", -1).limit(15)
         )
-        rows = cursor.fetchall()
         if not rows:
             await ctx.send("No businesses registered yet. Use `!startbiz` to found one!")
             return
@@ -310,7 +360,13 @@ class Business(commands.Cog):
         chunk_size = 6
         for idx in range(0, len(rows), chunk_size):
             embed = discord.Embed(title="🏢 Business Directory", color=discord.Color.dark_teal())
-            for biz_id, name, btype, emp, rep, cash, is_pub in rows[idx:idx + chunk_size]:
+            for row in rows[idx:idx + chunk_size]:
+                name = row["name"]
+                btype = row["type"]
+                emp = row["employees"]
+                rep = row["reputation"]
+                cash = row["cash"]
+                is_pub = row["is_public"]
                 pub_tag = " 📈" if is_pub else ""
                 embed.add_field(
                     name=f"{name}{pub_tag}",
@@ -346,10 +402,20 @@ class Business(commands.Cog):
             await ctx.send("Business closure cancelled.")
             return
 
-        liquidation = round(biz["cash"] * 0.5, 2)
         with write_txn():
-            cursor.execute("UPDATE businesses SET is_bankrupt = 1 WHERE biz_id = ?", (biz["biz_id"],))
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (liquidation, ctx.author.id))
+            closed = businesses.find_one_and_update(
+                {"biz_id": biz["biz_id"], "owner_id": ctx.author.id, "is_bankrupt": 0},
+                {"$set": {"is_bankrupt": 1}},
+            )
+            if not closed:
+                await ctx.send("Business is already closed.")
+                return
+            liquidation = round(float(closed.get("cash", 0.0)) * 0.5, 2)
+            credited = citizens.update_one({"user_id": ctx.author.id}, {"$inc": {"cash": liquidation}})
+            if credited.modified_count == 0:
+                businesses.update_one({"biz_id": biz["biz_id"]}, {"$set": {"is_bankrupt": 0}})
+                await ctx.send("Closure failed due to account state change. Please try again.")
+                return
         log_tx(ctx.author.id, "biz_close", liquidation, f"Liquidated {biz['name']}")
         await ctx.send(
             f"**{biz['name']}** has been closed. You received {fmt(liquidation)} in liquidation proceeds (50% of reserves)."
