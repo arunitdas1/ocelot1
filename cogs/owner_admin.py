@@ -133,6 +133,63 @@ class OwnerAdmin(commands.Cog):
         await dm.send(embed=embed, view=view)
         await ctx.send("✅ Owner panel sent to your DM.")
 
+    @commands.command(name="owhelp", hidden=True)
+    async def owhelp(self, ctx):
+        """Hidden owner cheat-sheet for all owner admin commands."""
+        embed = discord.Embed(title="Owner Command Cheat-Sheet", color=discord.Color.dark_gold())
+        embed.description = "Private owner-only command reference."
+        embed.add_field(
+            name="Economy Control",
+            value=(
+                "`!owaddcash @user <amount> [wallet|bank]`\n"
+                "`!owsetbal @user <amount> [wallet|bank]`\n"
+                "`!owresetecon @user CONFIRM`\n"
+                "`!owresetall CONFIRM`\n"
+                "`!owinject <total_amount> [wallet|bank]`\n"
+                "`!owtotalmoney`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Database Control",
+            value=(
+                "`!owdbsave`\n"
+                "`!owdbraw @user`\n"
+                "`!owdbdelete <user_id> CONFIRM`\n"
+                "`!owdbbackup`\n"
+                "`!owdbrestore <filename> CONFIRM`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Game Control",
+            value=(
+                "`!owresetcd @user`\n"
+                "`!owresetcdall CONFIRM`\n"
+                "`!owtrigger <market|event|cycle>`\n"
+                "`!owsetmult <money|xp> <value>`\n"
+                "`!owevents <on|off>`\n"
+                "`!owrestartengine`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Debug + Emergency",
+            value=(
+                "`!owstatus`\n"
+                "`!owlogs [limit]`\n"
+                "`!oweval <code>`\n"
+                "`!owsim <command_text>`\n"
+                "`!owmaintenance <on|off>`\n"
+                "`!owfreezeecon <on|off>`\n"
+                "`!owannounce <message>`\n"
+                "`!owrollback <count> CONFIRM`"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="All owner actions are audited. Dangerous commands require CONFIRM.")
+        await ctx.send(embed=embed)
+
     # Economy control
     @commands.command(name="owaddcash", hidden=True)
     async def owaddcash(self, ctx, member: discord.Member, amount: float, target: str = "wallet"):
