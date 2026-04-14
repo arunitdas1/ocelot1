@@ -1,6 +1,6 @@
 # Economy Bot — Full Macroeconomic Simulation
 
-A deeply realistic, persistent, Discord economy bot that simulates a living, breathing national economy.
+A deeply realistic, persistent, Discord economy bot that simulates a economy.
 
 ## Tech Stack
 - **Language:** Python 3.11
