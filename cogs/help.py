@@ -186,9 +186,9 @@ class Help(commands.Cog):
             return "leaderboard"
         if cog in {"government"}:
             return "admin"
-        if cog in {"help", "onboarding"}:
+        if cog in {"help", "onboarding", "reminders"}:
             return "utility"
-        if cog in {"jobs", "profile", "finance", "insurance", "contracts", "trust", "legal"}:
+        if cog in {"jobs", "profile", "finance", "insurance", "contracts", "trust", "legal", "quests", "eventshub", "achievements"}:
             return "economy"
         return "misc"
 
@@ -217,7 +217,7 @@ class Help(commands.Cog):
         )
         embed.add_field(name="Total Commands", value=str(total_commands), inline=True)
         embed.add_field(name="Visible Categories", value=str(len(categories)), inline=True)
-        embed.add_field(name="Quick Start", value=f"`{prefix}start` → `{prefix}profile` → `{prefix}jobs` → `{prefix}work`", inline=False)
+        embed.add_field(name="Quick Start", value=f"`{prefix}start` → `{prefix}quests` → `{prefix}nextaction`", inline=False)
         lines = [f"{label} — **{count}**" for label, count in categories]
         embed.add_field(name="Categories", value="\n".join(lines) if lines else "No commands found.", inline=False)
         embed.set_footer(text="Use buttons below to navigate categories.")

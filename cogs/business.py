@@ -1,11 +1,12 @@
 import re
+import sqlite3
 import time
 import math
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, add_gov_revenue
-from utils import safe_float, clamp, add_reputation
+from utils import clamp, add_reputation
 from cogs.ui_components import PaginatorView, ConfirmView
 
 BIZ_TYPES = {
@@ -81,11 +82,24 @@ class Business(commands.Cog):
             return
 
         cursor.execute(
-            "INSERT INTO businesses(owner_id, name, type, founded_at) VALUES (?, ?, ?, ?)",
-            (ctx.author.id, name, btype, int(time.time()))
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (cost, ctx.author.id, cost),
         )
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (cost, ctx.author.id))
-        conn.commit()
+        if cursor.rowcount == 0:
+            latest = get_citizen(ctx.author.id)
+            await ctx.send(f"You need {fmt(cost)} to start a {BIZ_TYPES[btype]['name']}. You have {fmt(latest['cash'])}.")
+            return
+        try:
+            with write_txn():
+                cursor.execute(
+                    "INSERT INTO businesses(owner_id, name, type, founded_at) VALUES (?, ?, ?, ?)",
+                    (ctx.author.id, name, btype, int(time.time()))
+                )
+        except sqlite3.IntegrityError:
+            with write_txn():
+                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (cost, ctx.author.id))
+            await ctx.send("Business name is already taken. Please choose another name.")
+            return
         log_tx(ctx.author.id, "biz_startup", -cost, f"Founded {name}")
         await ctx.send(
             f"🏢 **{name}** ({BIZ_TYPES[btype]['name']}) has been founded!\n"
@@ -142,18 +156,19 @@ class Business(commands.Cog):
         compliance = round(max(0.0, (employees / 10) * 25.0), 2)
         total = round(payroll + compliance, 2)
 
-        cursor.execute(
-            "UPDATE businesses SET cash = cash - ?, expenses = expenses + ? WHERE biz_id = ? AND cash >= ?",
-            (total, total, biz["biz_id"], total),
-        )
-        if cursor.rowcount == 0:
+        rep_delta = clamp(0.5 + employees * 0.01, 0.5, 2.0)
+        try:
+            with write_txn():
+                cursor.execute(
+                    "UPDATE businesses SET cash = cash - ?, expenses = expenses + ? WHERE biz_id = ? AND cash >= ?",
+                    (total, total, biz["biz_id"], total),
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("INSUFFICIENT_BIZ_CASH")
+                cursor.execute("UPDATE businesses SET reputation = MIN(100, reputation + ?) WHERE biz_id = ?", (rep_delta, biz["biz_id"]))
+        except RuntimeError:
             await ctx.send(f"Insufficient business reserves for ops. Needed: {fmt(total)}.")
             return
-
-        # Small rep drift: paying ops on time increases rep slightly
-        rep_delta = clamp(0.5 + employees * 0.01, 0.5, 2.0)
-        cursor.execute("UPDATE businesses SET reputation = MIN(100, reputation + ?) WHERE biz_id = ?", (rep_delta, biz["biz_id"]))
-        conn.commit()
         add_reputation("business", biz["biz_id"], rep_delta, reason="operations_cycle", source_type="bizops", source_id=str(ctx.author.id))
 
         await ctx.send(f"✅ Operations cycle complete. Payroll: {fmt(payroll)} | Compliance: {fmt(compliance)} | Rep +{rep_delta:.2f}")
@@ -177,9 +192,18 @@ class Business(commands.Cog):
         if c["cash"] < amount:
             await ctx.send(f"Insufficient cash. You have {fmt(c['cash'])}.")
             return
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (amount, ctx.author.id))
-        cursor.execute("UPDATE businesses SET cash = cash + ? WHERE biz_id = ?", (amount, biz["biz_id"]))
-        conn.commit()
+        try:
+            with write_txn():
+                cursor.execute(
+                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+                    (amount, ctx.author.id, amount),
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("INSUFFICIENT_CASH")
+                cursor.execute("UPDATE businesses SET cash = cash + ? WHERE biz_id = ?", (amount, biz["biz_id"]))
+        except RuntimeError:
+            await ctx.send("Insufficient cash due to concurrent balance change.")
+            return
         log_tx(ctx.author.id, "biz_deposit", -amount, f"Injected into {biz['name']}")
         await ctx.send(f"✅ Deposited {fmt(amount)} into **{biz['name']}**.")
 
@@ -204,9 +228,18 @@ class Business(commands.Cog):
 
         corp_tax = round(amount * 0.20, 2)
         net = round(amount - corp_tax, 2)
-        cursor.execute("UPDATE businesses SET cash = cash - ? WHERE biz_id = ?", (amount, biz["biz_id"]))
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (net, ctx.author.id))
-        conn.commit()
+        try:
+            with write_txn():
+                cursor.execute(
+                    "UPDATE businesses SET cash = cash - ? WHERE biz_id = ? AND cash >= ?",
+                    (amount, biz["biz_id"], amount),
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("INSUFFICIENT_BIZ_CASH")
+                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (net, ctx.author.id))
+        except RuntimeError:
+            await ctx.send("Business reserves changed; withdrawal cancelled.")
+            return
         add_gov_revenue(corp_tax)
         log_tx(ctx.author.id, "biz_withdraw", net, f"Withdrew from {biz['name']} (20% corp tax)")
         await ctx.send(f"💰 Withdrew {fmt(amount)} from **{biz['name']}** — {fmt(corp_tax)} corporate tax deducted. Net: {fmt(net)}.")
@@ -229,11 +262,11 @@ class Business(commands.Cog):
         new_count = biz["employees"] + 1
         revenue_boost = round(biz["revenue"] + (EMPLOYEE_COST * 0.5), 2)
         new_expenses = round(biz["expenses"] + EMPLOYEE_COST, 2)
-        cursor.execute(
-            "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
-            (new_count, revenue_boost, new_expenses, biz["biz_id"])
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
+                (new_count, revenue_boost, new_expenses, biz["biz_id"])
+            )
         await ctx.send(
             f"✅ Hired employee #{new_count} for **{biz['name']}**.\n"
             f"Cost: {fmt(EMPLOYEE_COST)}/cycle | Estimated revenue boost: +{fmt(EMPLOYEE_COST * 0.5)}/cycle"
@@ -254,11 +287,11 @@ class Business(commands.Cog):
         new_count = biz["employees"] - 1
         revenue_cut = round(biz["revenue"] - (EMPLOYEE_COST * 0.5), 2)
         new_expenses = round(biz["expenses"] - EMPLOYEE_COST, 2)
-        cursor.execute(
-            "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
-            (new_count, max(0, revenue_cut), max(0, new_expenses), biz["biz_id"])
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE businesses SET employees = ?, revenue = ?, expenses = ? WHERE biz_id = ?",
+                (new_count, max(0, revenue_cut), max(0, new_expenses), biz["biz_id"])
+            )
         await ctx.send(f"Employee laid off. **{biz['name']}** now has {new_count} employees.")
 
     @commands.command(aliases=["businesses"])
@@ -307,16 +340,16 @@ class Business(commands.Cog):
             description=f"Close **{biz['name']}** permanently?\nYou will receive 50% of reserves as liquidation.",
             color=discord.Color.red(),
         )
-        msg = await ctx.send(embed=prompt, view=confirm)
+        await ctx.send(embed=prompt, view=confirm)
         await confirm.wait()
         if confirm.value is not True:
             await ctx.send("Business closure cancelled.")
             return
 
         liquidation = round(biz["cash"] * 0.5, 2)
-        cursor.execute("UPDATE businesses SET is_bankrupt = 1 WHERE biz_id = ?", (biz["biz_id"],))
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (liquidation, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE businesses SET is_bankrupt = 1 WHERE biz_id = ?", (biz["biz_id"],))
+            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (liquidation, ctx.author.id))
         log_tx(ctx.author.id, "biz_close", liquidation, f"Liquidated {biz['name']}")
         await ctx.send(
             f"**{biz['name']}** has been closed. You received {fmt(liquidation)} in liquidation proceeds (50% of reserves)."

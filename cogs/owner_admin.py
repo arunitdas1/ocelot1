@@ -1,6 +1,5 @@
 import os
 import gc
-import io
 import ast
 import time
 import json
@@ -443,6 +442,9 @@ class OwnerAdmin(commands.Cog):
         Owner-only eval/exec.
         WARNING: still powerful; kept hidden and owner-restricted.
         """
+        if os.getenv("ALLOW_OWNER_EVAL", "0") != "1":
+            await ctx.send("Owner eval is disabled. Set `ALLOW_OWNER_EVAL=1` to enable explicitly.")
+            return
         local_vars = {"bot": self.bot, "ctx": ctx, "cursor": cursor, "conn": conn, "discord": discord}
         try:
             if "\n" in code or code.strip().startswith(("for ", "while ", "if ", "def ", "async ")):
@@ -510,6 +512,36 @@ class OwnerAdmin(commands.Cog):
                     pass
         self._audit(ctx.author.id, "owannounce", message[:200])
         await ctx.send(f"✅ Announcement sent to {sent} server channels.")
+
+    @commands.command(name="oweventannounce", hidden=True)
+    async def oweventannounce(self, ctx, event_id: int):
+        """Broadcast a specific active event."""
+        cursor.execute(
+            "SELECT name, description, ends_at FROM active_events WHERE event_id = ?",
+            (event_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            await ctx.send("Event not found.")
+            return
+        name, description, ends_at = row
+        sent = 0
+        payload = (
+            f"🎯 **Limited-Time Event:** {name}\n"
+            f"{description}\n"
+            f"Ends: <t:{int(ends_at)}:R>\n"
+            f"Join with `!eventjoin {event_id}` and claim with `!eventrewards {event_id}`"
+        )
+        for guild in self.bot.guilds:
+            ch = guild.system_channel
+            if ch and ch.permissions_for(guild.me).send_messages:
+                try:
+                    await ch.send(payload)
+                    sent += 1
+                except Exception:
+                    pass
+        self._audit(ctx.author.id, "oweventannounce", f"event_id={event_id} sent={sent}")
+        await ctx.send(f"✅ Event announcement sent to {sent} channels.")
 
     @commands.command(name="owrollback", hidden=True)
     async def owrollback(self, ctx, count: int, confirm: str = ""):

@@ -2,7 +2,7 @@ import math
 import time
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     EDUCATION_LEVELS, calculate_income_tax, housing_expense, get_eco_state
@@ -77,17 +77,16 @@ class Profile(commands.Cog):
         ensure_citizen(ctx.author.id)
         ensure_citizen(member.id)
 
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (amount, ctx.author.id, amount)
-        )
-        if cursor.rowcount == 0:
-            sender = get_citizen(ctx.author.id)
-            await ctx.send(f"Insufficient funds! You only have {fmt(sender['cash'])} in your wallet.")
-            return
-
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, member.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+                (amount, ctx.author.id, amount)
+            )
+            if cursor.rowcount == 0:
+                sender = get_citizen(ctx.author.id)
+                await ctx.send(f"Insufficient funds! You only have {fmt(sender['cash'])} in your wallet.")
+                return
+            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, member.id))
         log_tx(ctx.author.id, "payment_sent", -amount, f"Paid {member.display_name}")
         log_tx(member.id, "payment_received", amount, f"Received from {ctx.author.display_name}")
 
@@ -120,9 +119,9 @@ class Profile(commands.Cog):
             amount = base + bonus
 
         amount = round(amount, 2)
-        cursor.execute("UPDATE citizens SET cash = cash + ?, last_daily = ? WHERE user_id = ?",
-                       (amount, now, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET cash = cash + ?, last_daily = ? WHERE user_id = ?",
+                           (amount, now, ctx.author.id))
         log_tx(ctx.author.id, "daily_income", amount, "Daily basic income")
         await ctx.send(f"✅ You claimed your daily income of **{fmt(amount)}**! Come back in 24 hours.")
 
@@ -183,6 +182,33 @@ class Profile(commands.Cog):
         view = PaginatorView(ctx.author.id, pages)
         msg = await ctx.send(embed=pages[0], view=view)
         view.message = msg
+
+    @commands.command(name="seasonboard")
+    async def seasonboard(self, ctx):
+        """View current season standings."""
+        cursor.execute("SELECT season_id, name FROM season_meta WHERE status = 'active' ORDER BY season_id DESC LIMIT 1")
+        season = cursor.fetchone()
+        if not season:
+            await ctx.send("No active season.")
+            return
+        season_id, season_name = season
+        cursor.execute(
+            "SELECT user_id, net_worth, work_shifts, quests_completed FROM season_stats "
+            "WHERE season_id = ? ORDER BY (net_worth + work_shifts * 50 + quests_completed * 100) DESC LIMIT 10",
+            (season_id,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            await ctx.send("No season activity yet.")
+            return
+        embed = discord.Embed(title=f"🏁 {season_name} Standings", color=discord.Color.gold())
+        for i, (uid, net, shifts, quests) in enumerate(rows, start=1):
+            embed.add_field(
+                name=f"#{i} <@{uid}>",
+                value=f"Net: {fmt(net)} | Shifts: {int(shifts)} | Quests: {int(quests)}",
+                inline=False,
+            )
+        await ctx.send(embed=embed)
 
     @commands.command()
     async def history(self, ctx, limit: int = 10):

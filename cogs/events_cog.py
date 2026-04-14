@@ -10,7 +10,7 @@ class EventsCog(commands.Cog, name="Events"):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="events")
+    @commands.command(name="worldevents")
     async def view_events(self, ctx):
         """View all active economic events affecting the world."""
         now = int(time.time())

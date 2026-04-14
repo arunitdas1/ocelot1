@@ -8,7 +8,7 @@ from utils import (
     get_eco_state, set_eco_state, get_gov, set_gov,
     get_all_citizens, log_tx, fmt,
     housing_expense, add_gov_revenue, deduct_gov_expense,
-    clamp, safe_float, safe_json_loads, housing_cost_for_tier, snapshot_macro
+    clamp, safe_float, safe_json_loads, housing_cost_for_tier, snapshot_macro, record_retention_metric
 )
 
 SUPPLY_DEPENDENCIES = {
@@ -274,8 +274,17 @@ class EconomyEngine(commands.Cog):
             duration = event["duration"]
 
             cursor.execute(
-                "INSERT INTO active_events(name, description, effects, started_at, ends_at) VALUES (?, ?, ?, ?, ?)",
-                (event["name"], event["description"], json.dumps(effects), now, now + duration)
+                "INSERT INTO active_events(name, description, effects, started_at, ends_at, tag, reward_pool, max_participants) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event["name"],
+                    event["description"],
+                    json.dumps(effects),
+                    now,
+                    now + duration,
+                    effects.get("price_multiplier_cat", "macro"),
+                    round(random.uniform(3000, 12000), 2),
+                    0,
+                )
             )
             conn.commit()
 
@@ -383,6 +392,13 @@ class EconomyEngine(commands.Cog):
                         deduct_gov_expense(welfare)
                         log_tx(uid, "welfare", welfare, "Unemployment welfare payment")
 
+            # Auto-release users whose jail timers have expired.
+            cursor.execute(
+                "UPDATE citizens SET is_jailed = 0, last_release_at = 0 "
+                "WHERE is_jailed = 1 AND last_release_at > 0 AND last_release_at <= ?",
+                (now,),
+            )
+
             # Insurance billing (daily)
             cursor.execute(
                 "SELECT policy_id, holder_id, premium, status, last_billed_at FROM insurance_policies WHERE status = 'active'"
@@ -460,6 +476,8 @@ class EconomyEngine(commands.Cog):
 
             conn.commit()
             self._update_phase()
+            self._refresh_quests(now)
+            self._record_retention_metrics(now)
             self._snapshot(now, defaults_last_7d)
             print(f"[EconomyEngine] Hourly cycle complete.")
 
@@ -540,6 +558,56 @@ class EconomyEngine(commands.Cog):
             bankrupt_businesses=int(bankrupt_biz),
             defaults_last_7d=int(defaults_last_7d),
         )
+
+    def _refresh_quests(self, now: int):
+        day_reset = now - (now % 86400) + 86400
+        week_reset = now - (now % (86400 * 7)) + (86400 * 7)
+        cursor.execute("SELECT user_id FROM citizens")
+        users = [r[0] for r in cursor.fetchall()]
+        cursor.execute("SELECT key, target_type, target_value FROM quests_daily WHERE is_active = 1")
+        daily = cursor.fetchall()
+        cursor.execute("SELECT key, target_type, target_value FROM quests_weekly WHERE is_active = 1")
+        weekly = cursor.fetchall()
+        for uid in users:
+            for key, _, target in daily:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO user_quests(user_id, quest_type, quest_key, progress, target, claimed, assigned_at, resets_at) "
+                    "VALUES (?, 'daily', ?, 0, ?, 0, ?, ?)",
+                    (uid, key, float(target), now, day_reset),
+                )
+                cursor.execute(
+                    "UPDATE user_quests SET progress = CASE WHEN resets_at <= ? THEN 0 ELSE progress END, "
+                    "claimed = CASE WHEN resets_at <= ? THEN 0 ELSE claimed END, "
+                    "resets_at = CASE WHEN resets_at <= ? THEN ? ELSE resets_at END "
+                    "WHERE user_id = ? AND quest_type = 'daily' AND quest_key = ?",
+                    (now, now, now, day_reset, uid, key),
+                )
+            for key, _, target in weekly:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO user_quests(user_id, quest_type, quest_key, progress, target, claimed, assigned_at, resets_at) "
+                    "VALUES (?, 'weekly', ?, 0, ?, 0, ?, ?)",
+                    (uid, key, float(target), now, week_reset),
+                )
+                cursor.execute(
+                    "UPDATE user_quests SET progress = CASE WHEN resets_at <= ? THEN 0 ELSE progress END, "
+                    "claimed = CASE WHEN resets_at <= ? THEN 0 ELSE claimed END, "
+                    "resets_at = CASE WHEN resets_at <= ? THEN ? ELSE resets_at END "
+                    "WHERE user_id = ? AND quest_type = 'weekly' AND quest_key = ?",
+                    (now, now, now, week_reset, uid, key),
+                )
+        conn.commit()
+
+    def _record_retention_metrics(self, now: int):
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(now))
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions WHERE timestamp >= ?", (now - 86400,))
+        dau = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM user_quests WHERE progress >= target AND claimed = 1 AND assigned_at >= ?", (now - 86400,))
+        quest_claims = int(cursor.fetchone()[0] or 0)
+        cursor.execute("SELECT COUNT(*) FROM citizens WHERE daily_streak > 0")
+        active_streaks = int(cursor.fetchone()[0] or 0)
+        record_retention_metric("dau", dau, day_key)
+        record_retention_metric("quest_claims_24h", quest_claims, day_key)
+        record_retention_metric("active_streaks", active_streaks, day_key)
 
     @simulate_market.before_loop
     @trigger_events.before_loop

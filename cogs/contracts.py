@@ -3,7 +3,7 @@ import json
 import math
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import ensure_citizen, fmt
 
 
@@ -37,17 +37,17 @@ class Contracts(commands.Cog):
         ensure_citizen(member.id)
 
         terms_json = json.dumps({"text": terms[:1500]})
-        cursor.execute(
-            "INSERT INTO contracts(contract_type, party_a_type, party_a_id, party_b_type, party_b_id, terms_json, value, status, created_at, last_event_at) "
-            "VALUES (?, 'citizen', ?, 'citizen', ?, ?, ?, 'draft', ?, ?)",
-            (contract_type.lower(), ctx.author.id, member.id, terms_json, round(value, 2), _now(), _now()),
-        )
-        contract_id = cursor.lastrowid
-        cursor.execute(
-            "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (contract_id, "created", json.dumps({"by": ctx.author.id}), _now()),
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "INSERT INTO contracts(contract_type, party_a_type, party_a_id, party_b_type, party_b_id, terms_json, value, status, created_at, last_event_at) "
+                "VALUES (?, 'citizen', ?, 'citizen', ?, ?, ?, 'draft', ?, ?)",
+                (contract_type.lower(), ctx.author.id, member.id, terms_json, round(value, 2), _now(), _now()),
+            )
+            contract_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (contract_id, "created", json.dumps({"by": ctx.author.id}), _now()),
+            )
 
         embed = discord.Embed(title="Contract created", color=discord.Color.green())
         embed.description = (
@@ -76,15 +76,15 @@ class Contracts(commands.Cog):
             await ctx.send("This contract is not in draft status.")
             return
 
-        cursor.execute(
-            "UPDATE contracts SET status = 'active', signed_at = ?, start_at = ?, end_at = ?, last_event_at = ? WHERE contract_id = ?",
-            (_now(), _now(), _now() + 7 * 86400, _now(), contract_id),
-        )
-        cursor.execute(
-            "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (contract_id, "signed", json.dumps({"by": ctx.author.id}), _now()),
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE contracts SET status = 'active', signed_at = ?, start_at = ?, end_at = ?, last_event_at = ? WHERE contract_id = ?",
+                (_now(), _now(), _now() + 7 * 86400, _now(), contract_id),
+            )
+            cursor.execute(
+                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (contract_id, "signed", json.dumps({"by": ctx.author.id}), _now()),
+            )
 
         await ctx.send("✅ Contract signed and activated.")
 
@@ -130,15 +130,15 @@ class Contracts(commands.Cog):
             await ctx.send("Contract is not active.")
             return
 
-        cursor.execute(
-            "UPDATE contracts SET status = 'fulfilled', last_event_at = ? WHERE contract_id = ?",
-            (_now(), contract_id),
-        )
-        cursor.execute(
-            "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (contract_id, "fulfilled", json.dumps({"by": ctx.author.id}), _now()),
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE contracts SET status = 'fulfilled', last_event_at = ? WHERE contract_id = ?",
+                (_now(), contract_id),
+            )
+            cursor.execute(
+                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (contract_id, "fulfilled", json.dumps({"by": ctx.author.id}), _now()),
+            )
 
         await ctx.send("✅ Contract marked fulfilled.")
 
@@ -158,17 +158,30 @@ class Contracts(commands.Cog):
             await ctx.send("You are not a party to this contract.")
             return
 
-        cursor.execute(
-            "UPDATE contracts SET status = 'disputed', last_event_at = ? WHERE contract_id = ?",
-            (_now(), contract_id),
-        )
-        cursor.execute(
-            "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (contract_id, "disputed", json.dumps({"by": ctx.author.id, "reason": reason[:500]}), _now()),
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE contracts SET status = 'disputed', last_event_at = ? WHERE contract_id = ?",
+                (_now(), contract_id),
+            )
+            cursor.execute(
+                "INSERT INTO contract_events(contract_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (contract_id, "disputed", json.dumps({"by": ctx.author.id, "reason": reason[:500]}), _now()),
+            )
 
         await ctx.send("✅ Dispute recorded.")
+
+    @contract.command(name="challenge")
+    async def challenge(self, ctx):
+        """Weekly social contract challenge."""
+        embed = discord.Embed(title="Contract Challenge", color=discord.Color.blue())
+        embed.description = (
+            "Weekly challenge:\n"
+            "- Create 2 contracts\n"
+            "- Successfully fulfill at least 1\n"
+            "- Avoid disputes\n\n"
+            "Tip: use `!contract list` to monitor your progress."
+        )
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):

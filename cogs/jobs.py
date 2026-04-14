@@ -2,7 +2,7 @@ import time
 import random
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
@@ -140,11 +140,11 @@ class Jobs(commands.Cog):
             await ctx.send(f"This job requires **{j['edu'].title()}** education. Use `!educate` to qualify.")
             return
 
-        cursor.execute(
-            "UPDATE citizens SET job_id = ?, job_xp = 0, last_work = 0 WHERE user_id = ?",
-            (job_id, ctx.author.id)
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET job_id = ?, job_xp = 0, last_work = 0 WHERE user_id = ?",
+                (job_id, ctx.author.id)
+            )
         await ctx.send(f"✅ You've been hired as a **{j['name']}**! Use `!work` to clock in for your first shift.")
 
     @commands.command(aliases=["quitjob"])
@@ -157,9 +157,9 @@ class Jobs(commands.Cog):
             return
 
         job_name = JOBS[c["job_id"]]["name"]
-        cursor.execute("UPDATE citizens SET job_id = NULL, job_xp = 0, last_work = 0 WHERE user_id = ?",
-                       (ctx.author.id,))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET job_id = NULL, job_xp = 0, last_work = 0 WHERE user_id = ?",
+                           (ctx.author.id,))
         await ctx.send(f"You've resigned from **{job_name}**. Your XP has been reset.")
 
     @commands.command()
@@ -202,11 +202,11 @@ class Jobs(commands.Cog):
         net = round(gross - tax, 2)
         new_xp = c["job_xp"] + int(round(50 * xp_mult))
 
-        cursor.execute(
-            "UPDATE citizens SET bank = bank + ?, job_xp = ?, last_work = ? WHERE user_id = ?",
-            (net, new_xp, now, ctx.author.id)
-        )
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET bank = bank + ?, job_xp = ?, last_work = ? WHERE user_id = ?",
+                (net, new_xp, now, ctx.author.id)
+            )
         add_gov_revenue(tax)
         log_tx(ctx.author.id, "salary", net, f"{j['name']} shift pay (after tax)")
         record_employment_event(ctx.author.id, "worked", c["job_id"], f"net={net}")
@@ -280,9 +280,9 @@ class Jobs(commands.Cog):
             await ctx.send(f"You need **{fmt(cost)}** for {level} education. You have {fmt(c['cash'])}.")
             return
 
-        cursor.execute("UPDATE citizens SET cash = cash - ?, education = ? WHERE user_id = ?",
-                       (cost, level, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET cash = cash - ?, education = ? WHERE user_id = ?",
+                           (cost, level, ctx.author.id))
         log_tx(ctx.author.id, "education", -cost, f"Enrolled in {level} education")
         await ctx.send(
             f"🎓 You've completed **{level.title()}** education! Cost: {fmt(cost)}.\n"
@@ -305,9 +305,9 @@ class Jobs(commands.Cog):
             return
 
         new_skill = c["skill_level"] + 1
-        cursor.execute("UPDATE citizens SET cash = cash - ?, skill_level = ? WHERE user_id = ?",
-                       (cost, new_skill, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET cash = cash - ?, skill_level = ? WHERE user_id = ?",
+                           (cost, new_skill, ctx.author.id))
         log_tx(ctx.author.id, "training", -cost, f"Skill training Lv{c['skill_level']} → Lv{new_skill}")
         await ctx.send(
             f"💪 Training complete! Skill Level: **{c['skill_level']} → {new_skill}**.\n"

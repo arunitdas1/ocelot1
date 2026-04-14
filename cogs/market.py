@@ -1,7 +1,7 @@
 import time
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, get_eco_state, add_gov_revenue, get_trust, clamp
 from cogs.ui_components import PaginatorView, ConfirmView
 
@@ -112,20 +112,28 @@ class Market(commands.Cog):
             )
             return
 
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (total, ctx.author.id, total)
-        )
-        if cursor.rowcount == 0:
-            latest = get_citizen(ctx.author.id)
-            await ctx.send(f"Not enough cash. Total: {fmt(total)}. Wallet: {fmt(latest['cash'])}.")
+        try:
+            with write_txn():
+                cursor.execute(
+                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+                    (total, ctx.author.id, total)
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("INSUFFICIENT_CASH")
+                cursor.execute(
+                    "UPDATE market_goods SET supply = supply - ?, demand = demand + ? WHERE good_id = ? AND supply >= ?",
+                    (quantity, quantity // 2 + 1, good_id, quantity)
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("SUPPLY_CHANGED")
+                update_inventory(ctx.author.id, good_id, quantity)
+        except RuntimeError as e:
+            if str(e) == "INSUFFICIENT_CASH":
+                latest = get_citizen(ctx.author.id)
+                await ctx.send(f"Not enough cash. Total: {fmt(total)}. Wallet: {fmt(latest['cash'])}.")
+            else:
+                await ctx.send("Market stock changed while purchasing. Please try again.")
             return
-        cursor.execute(
-            "UPDATE market_goods SET supply = supply - ?, demand = demand + ? WHERE good_id = ?",
-            (quantity, quantity // 2 + 1, good_id)
-        )
-        update_inventory(ctx.author.id, good_id, quantity)
-        conn.commit()
         add_gov_revenue(sales_tax)
         log_tx(ctx.author.id, "market_buy", -total, f"Bought {quantity}x {good['name']}")
 
@@ -158,12 +166,12 @@ class Market(commands.Cog):
             await ctx.send(f"Price too high. Maximum listing price: {fmt(max_price)} (3x market rate).")
             return
 
-        update_inventory(ctx.author.id, good_id, -quantity)
-        cursor.execute(
-            "INSERT INTO market_listings(seller_id, good_id, quantity, price_per_unit, listed_at) VALUES (?, ?, ?, ?, ?)",
-            (ctx.author.id, good_id, quantity, price, int(time.time()))
-        )
-        conn.commit()
+        with write_txn():
+            update_inventory(ctx.author.id, good_id, -quantity)
+            cursor.execute(
+                "INSERT INTO market_listings(seller_id, good_id, quantity, price_per_unit, listed_at) VALUES (?, ?, ?, ?, ?)",
+                (ctx.author.id, good_id, quantity, price, int(time.time()))
+            )
         await ctx.send(
             f"📋 Listed **{quantity}x {good['name']}** at {fmt(price)}/unit. "
             f"Use `!listings` to manage your listings."
@@ -203,18 +211,26 @@ class Market(commands.Cog):
         platform_fee = clamp(0.05 + (0.2 - trust) * 0.03, 0.03, 0.08)
         seller_gets = round(total * (1.0 - platform_fee), 2)
 
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (grand, ctx.author.id, grand)
-        )
-        if cursor.rowcount == 0:
-            latest = get_citizen(ctx.author.id)
-            await ctx.send(f"Not enough cash. Total: {fmt(grand)}. You have {fmt(latest['cash'])}.")
+        try:
+            with write_txn():
+                cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?", (grand, ctx.author.id, grand))
+                if cursor.rowcount == 0:
+                    raise RuntimeError("INSUFFICIENT_CASH")
+                cursor.execute(
+                    "DELETE FROM market_listings WHERE listing_id = ? AND seller_id = ? AND good_id = ? AND quantity = ? AND price_per_unit = ?",
+                    (lid, seller_id, good_id, qty, price_per),
+                )
+                if cursor.rowcount == 0:
+                    raise RuntimeError("LISTING_GONE")
+                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (seller_gets, seller_id))
+                update_inventory(ctx.author.id, good_id, qty)
+        except RuntimeError as e:
+            if str(e) == "INSUFFICIENT_CASH":
+                latest = get_citizen(ctx.author.id)
+                await ctx.send(f"Not enough cash. Total: {fmt(grand)}. You have {fmt(latest['cash'])}.")
+            else:
+                await ctx.send("Listing is no longer available. Please try another listing.")
             return
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (seller_gets, seller_id))
-        cursor.execute("DELETE FROM market_listings WHERE listing_id = ?", (lid,))
-        update_inventory(ctx.author.id, good_id, qty)
-        conn.commit()
         add_gov_revenue(sales_tax + (total - seller_gets))
         log_tx(ctx.author.id, "p2p_buy", -grand, f"Bought {qty}x {good['name']} from player listing")
         log_tx(seller_id, "p2p_sell", seller_gets, f"Sold {qty}x {good['name']} via listing")
@@ -330,18 +346,31 @@ class Market(commands.Cog):
             description=f"Delist listing **#{listing_id}** and return items to your inventory?",
             color=discord.Color.orange(),
         )
-        msg = await ctx.send(embed=prompt, view=confirm)
+        await ctx.send(embed=prompt, view=confirm)
         await confirm.wait()
         if confirm.value is not True:
             await ctx.send("Delist cancelled.")
             return
 
         lid, good_id, qty = row
-        update_inventory(ctx.author.id, good_id, qty)
-        cursor.execute("DELETE FROM market_listings WHERE listing_id = ?", (lid,))
-        conn.commit()
+        with write_txn():
+            update_inventory(ctx.author.id, good_id, qty)
+            cursor.execute("DELETE FROM market_listings WHERE listing_id = ?", (lid,))
         good = get_good(good_id)
         await ctx.send(f"✅ Listing #{lid} removed. {qty}x **{good['name']}** returned to your inventory.")
+
+    @commands.command(name="marketchallenge")
+    async def marketchallenge(self, ctx):
+        """Daily social market challenge prompt."""
+        embed = discord.Embed(title="Market Challenge", color=discord.Color.orange())
+        embed.description = (
+            "Today's challenge:\n"
+            "1) Complete 3 market actions (`!buy`, `!sell`, or `!buyp2p`)\n"
+            "2) Keep your net trade spend under $2,000\n"
+            "3) Post your result with `!history 5`\n\n"
+            "Reward path: quest + season progression."
+        )
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):

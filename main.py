@@ -6,11 +6,16 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from keep_alive import keep_alive
-from utils import get_eco_state
+from db import cursor, conn
+from utils import (
+    get_eco_state,
+    increment_quest_progress,
+    increment_achievement_progress,
+    update_season_stat,
+)
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
 keep_alive()
 
 intents = discord.Intents.default()
@@ -140,6 +145,10 @@ COGS = [
     "cogs.legal",
     "cogs.finance",
     "cogs.onboarding",
+    "cogs.quests",
+    "cogs.events_hub",
+    "cogs.achievements",
+    "cogs.reminders",
     "cogs.owner_admin",
 ]
 
@@ -204,6 +213,64 @@ async def anti_abuse_guard(ctx):
 
 @bot.after_invoke
 async def release_after_command(ctx):
+    if ctx.command:
+        cmd = ctx.command.qualified_name.lower()
+        uid = ctx.author.id
+        if cmd in {"work"}:
+            increment_quest_progress(uid, "work_count", 1)
+            increment_achievement_progress(uid, "work_count", 1)
+            update_season_stat(uid, "work_shifts", 1)
+        if cmd in {"buy", "sell", "buyp2p", "invest", "divest"}:
+            increment_quest_progress(uid, "trade_count", 1)
+            increment_achievement_progress(uid, "trade_count", 1)
+            update_season_stat(uid, "trade_volume", 1)
+            cursor.execute(
+                "SELECT event_id FROM event_participants ep JOIN active_events ae ON ae.event_id = ep.event_id "
+                "WHERE ep.user_id = ? AND ae.ends_at > strftime('%s','now')",
+                (uid,),
+            )
+            for (event_id,) in cursor.fetchall():
+                cursor.execute(
+                    "UPDATE event_participants SET points = points + 1 WHERE event_id = ? AND user_id = ?",
+                    (event_id, uid),
+                )
+            conn.commit()
+        if cmd in {"deposit"}:
+            deposited = float(getattr(ctx, "_last_deposit_amount", 0.0) or 0.0)
+            if deposited > 0:
+                increment_quest_progress(uid, "bank_gain", deposited)
+                increment_achievement_progress(uid, "net_worth", deposited)
+                ctx._last_deposit_amount = 0.0
+        if cmd in {"daily"}:
+            now = int(time.time())
+            day = now // 86400
+            cursor.execute("SELECT daily_streak, last_streak_claim FROM citizens WHERE user_id = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                streak, last_claim = int(row[0] or 0), int(row[1] or 0)
+                last_day = last_claim // 86400 if last_claim else 0
+                if last_day == day:
+                    pass
+                elif day - last_day == 1:
+                    streak += 1
+                elif day - last_day > 1:
+                    cursor.execute("SELECT streak_protect_tokens FROM citizens WHERE user_id = ?", (uid,))
+                    tokens = int(cursor.fetchone()[0] or 0)
+                    if tokens > 0 and day - last_day == 2:
+                        cursor.execute("UPDATE citizens SET streak_protect_tokens = streak_protect_tokens - 1 WHERE user_id = ?", (uid,))
+                        streak = max(1, streak)
+                    else:
+                        streak = 1
+                else:
+                    streak = max(1, streak)
+                if streak in {3, 7, 14, 30}:
+                    cursor.execute("UPDATE citizens SET streak_protect_tokens = streak_protect_tokens + 1 WHERE user_id = ?", (uid,))
+                cursor.execute(
+                    "UPDATE citizens SET daily_streak = ?, last_streak_claim = ? WHERE user_id = ?",
+                    (streak, now, uid),
+                )
+                conn.commit()
+
     await _release_ctx_lock(ctx)
 
 

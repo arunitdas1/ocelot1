@@ -3,7 +3,7 @@ import random
 import math
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import ensure_citizen, get_citizen, fmt, record_offense
 
 
@@ -48,29 +48,31 @@ class Legal(commands.Cog):
         caught = random.random() < detect
         if caught:
             record_offense(ctx.author.id, offense_type, severity, fine, jail_seconds, detect)
-            cursor.execute("UPDATE citizens SET wanted_level = MIN(10, wanted_level + 1), criminal_record_points = criminal_record_points + ? WHERE user_id = ?",
-                           (severity, ctx.author.id))
-            # Fine collection is atomic
-            cursor.execute(
-                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-                (fine, ctx.author.id, fine),
-            )
-            paid = cursor.rowcount > 0
-            if not paid:
-                # Convert unpaid fine to debt
-                cursor.execute("UPDATE citizens SET debt = debt + ? WHERE user_id = ?", (fine, ctx.author.id))
-            if jail_seconds > 0:
-                cursor.execute("UPDATE citizens SET is_jailed = 1 WHERE user_id = ?", (ctx.author.id,))
-            conn.commit()
+            with write_txn():
+                cursor.execute("UPDATE citizens SET wanted_level = MIN(10, wanted_level + 1), criminal_record_points = criminal_record_points + ? WHERE user_id = ?",
+                               (severity, ctx.author.id))
+                cursor.execute(
+                    "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+                    (fine, ctx.author.id, fine),
+                )
+                paid = cursor.rowcount > 0
+                if not paid:
+                    cursor.execute("UPDATE citizens SET debt = debt + ? WHERE user_id = ?", (fine, ctx.author.id))
+                if jail_seconds > 0:
+                    jail_until = int(time.time()) + jail_seconds
+                    cursor.execute(
+                        "UPDATE citizens SET is_jailed = 1, last_release_at = ? WHERE user_id = ?",
+                        (jail_until, ctx.author.id),
+                    )
             await ctx.send(
                 f"❌ Caught committing **{offense_type}**.\n"
                 f"Fine: {fmt(fine)} ({'paid' if paid else 'added to debt'}) | Jail: {jail_seconds//60} min | Detection: {detect*100:.0f}%"
             )
             return
 
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (reward, ctx.author.id))
-        cursor.execute("UPDATE citizens SET wanted_level = MAX(0, wanted_level - 1) WHERE user_id = ?", (ctx.author.id,))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (reward, ctx.author.id))
+            cursor.execute("UPDATE citizens SET wanted_level = MAX(0, wanted_level - 1) WHERE user_id = ?", (ctx.author.id,))
         await ctx.send(f"✅ Crime succeeded: **{offense_type}**. You gained **{fmt(reward)}**. (Detection risk was {detect*100:.0f}%)")
 
     @commands.command(name="record")
@@ -116,8 +118,8 @@ class Legal(commands.Cog):
         if cursor.rowcount == 0:
             await ctx.send(f"You need {fmt(bail_cost)} cash for bail.")
             return
-        cursor.execute("UPDATE citizens SET is_jailed = 0, last_release_at = ? WHERE user_id = ?", (int(time.time()), ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute("UPDATE citizens SET is_jailed = 0, last_release_at = 0 WHERE user_id = ?", (ctx.author.id,))
         await ctx.send(f"✅ Bail paid: {fmt(bail_cost)}. You are free.")
 
 

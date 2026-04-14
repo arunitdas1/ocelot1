@@ -3,7 +3,7 @@ from discord.ext import commands
 import math
 import time
 import os
-from db import cursor, conn
+from db import cursor, write_txn
 from utils import (
     ensure_citizen, get_citizen, fmt,
     get_gov, set_gov, deduct_gov_expense,
@@ -88,14 +88,14 @@ class Government(commands.Cog):
             return
 
         ts = int(time.time())
-        for uid in all_citizens:
-            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, uid))
-            cursor.execute(
-                "INSERT INTO transactions(user_id, tx_type, amount, description, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (uid, "stimulus", amount, "Government stimulus payment", ts)
-            )
-        deduct_gov_expense(total_cost)
-        conn.commit()
+        with write_txn():
+            for uid in all_citizens:
+                cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, uid))
+                cursor.execute(
+                    "INSERT INTO transactions(user_id, tx_type, amount, description, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (uid, "stimulus", amount, "Government stimulus payment", ts)
+                )
+            deduct_gov_expense(total_cost)
         await ctx.send(
             f"✅ Stimulus of **{fmt(amount)}** sent to all **{len(all_citizens)}** citizens.\n"
             f"Total cost: {fmt(total_cost)} | Remaining reserves: {fmt(reserves - total_cost)}"
@@ -222,7 +222,7 @@ class Government(commands.Cog):
             ),
             color=discord.Color.orange(),
         )
-        msg = await ctx.send(embed=prompt, view=confirm)
+        await ctx.send(embed=prompt, view=confirm)
         await confirm.wait()
         if confirm.value is not True:
             await ctx.send("Money printing cancelled.")

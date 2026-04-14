@@ -1,4 +1,9 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+.env
+.env.*
+backups/
+economy.db-shm
+economy.db-wal
 

@@ -1,11 +1,28 @@
 import sqlite3
-import json
 import time
+import threading
+from contextlib import contextmanager
 
 conn = sqlite3.connect("economy.db", check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA foreign_keys=ON")
+conn.execute("PRAGMA busy_timeout=5000")
 cursor = conn.cursor()
+_db_write_lock = threading.RLock()
+
+
+@contextmanager
+def write_txn():
+    """
+    Serialize multi-step writes so related balance/state mutations are atomic.
+    """
+    with _db_write_lock:
+        try:
+            yield
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 cursor.executescript("""
 CREATE TABLE IF NOT EXISTS citizens (
@@ -401,6 +418,188 @@ def _apply_migrations():
                 cursor.execute("INSERT OR IGNORE INTO economy_state(key, value) VALUES (?, ?)", (k, val))
 
             _set_user_version(2)
+            conn.commit()
+            v = 2
+
+        if v < 3:
+            # Quests + streaks
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS quests_daily (
+                quest_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_value REAL NOT NULL,
+                reward_cash REAL DEFAULT 0.0,
+                reward_xp INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS quests_weekly (
+                quest_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_value REAL NOT NULL,
+                reward_cash REAL DEFAULT 0.0,
+                reward_xp INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_quests (
+                user_id INTEGER NOT NULL,
+                quest_type TEXT NOT NULL,
+                quest_key TEXT NOT NULL,
+                progress REAL DEFAULT 0.0,
+                target REAL DEFAULT 1.0,
+                claimed INTEGER DEFAULT 0,
+                assigned_at INTEGER DEFAULT 0,
+                resets_at INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, quest_type, quest_key)
+            )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_quests_reset ON user_quests(user_id, resets_at)")
+            _ensure_column("citizens", "daily_streak", "INTEGER DEFAULT 0")
+            _ensure_column("citizens", "last_streak_claim", "INTEGER DEFAULT 0")
+            _ensure_column("citizens", "streak_protect_tokens", "INTEGER DEFAULT 0")
+
+            # Event hub
+            _ensure_column("active_events", "tag", "TEXT DEFAULT ''")
+            _ensure_column("active_events", "reward_pool", "REAL DEFAULT 0.0")
+            _ensure_column("active_events", "max_participants", "INTEGER DEFAULT 0")
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS event_participants (
+                event_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points REAL DEFAULT 0.0,
+                joined_at INTEGER DEFAULT 0,
+                claimed INTEGER DEFAULT 0,
+                PRIMARY KEY (event_id, user_id)
+            )
+            """)
+
+            # Achievements / collections
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS achievements (
+                ach_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                metric_key TEXT NOT NULL,
+                target_value REAL NOT NULL,
+                reward_cash REAL DEFAULT 0.0,
+                reward_badge TEXT DEFAULT ''
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_achievements (
+                user_id INTEGER NOT NULL,
+                ach_key TEXT NOT NULL,
+                progress REAL DEFAULT 0.0,
+                unlocked INTEGER DEFAULT 0,
+                claimed INTEGER DEFAULT 0,
+                unlocked_at INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, ach_key)
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS collections (
+                user_id INTEGER NOT NULL,
+                collection_key TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                obtained_at INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, collection_key, item_key)
+            )
+            """)
+
+            # Seasonal ladders
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS season_meta (
+                season_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                starts_at INTEGER NOT NULL,
+                ends_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'active'
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS season_stats (
+                season_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                net_worth REAL DEFAULT 0.0,
+                trade_volume REAL DEFAULT 0.0,
+                work_shifts INTEGER DEFAULT 0,
+                quests_completed INTEGER DEFAULT 0,
+                updated_at INTEGER DEFAULT 0,
+                PRIMARY KEY (season_id, user_id)
+            )
+            """)
+
+            # Reminder preferences
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reminder_prefs (
+                user_id INTEGER PRIMARY KEY,
+                dm_enabled INTEGER DEFAULT 0,
+                daily_ready INTEGER DEFAULT 1,
+                work_ready INTEGER DEFAULT 1,
+                quest_ready INTEGER DEFAULT 1,
+                updated_at INTEGER DEFAULT 0
+            )
+            """)
+
+            # Retention metrics
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS retention_metrics (
+                metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_key TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                metric_value REAL DEFAULT 0.0,
+                created_at INTEGER DEFAULT 0
+            )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_retention_metrics_day ON retention_metrics(day_key, metric_name)")
+
+            # Seed quest / achievement catalogs
+            daily_seed = [
+                ("daily_work_3", "Shift Worker", "Complete 3 work shifts today", "work_count", 3, 250.0, 25),
+                ("daily_trade_5", "Trader", "Complete 5 market actions today", "trade_count", 5, 200.0, 20),
+                ("daily_save_500", "Saver", "Increase bank balance by $500 today", "bank_gain", 500, 180.0, 15),
+            ]
+            weekly_seed = [
+                ("weekly_work_15", "Workhorse", "Complete 15 shifts this week", "work_count", 15, 1200.0, 100),
+                ("weekly_trade_20", "Market Maker", "Complete 20 trade actions this week", "trade_count", 20, 1000.0, 80),
+            ]
+            cursor.executemany(
+                "INSERT OR IGNORE INTO quests_daily(key, title, description, target_type, target_value, reward_cash, reward_xp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                daily_seed,
+            )
+            cursor.executemany(
+                "INSERT OR IGNORE INTO quests_weekly(key, title, description, target_type, target_value, reward_cash, reward_xp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                weekly_seed,
+            )
+            ach_seed = [
+                ("ach_networth_10k", "Five Digits", "Reach $10,000 net worth", "net_worth", 10000, 500, "Bronze Saver"),
+                ("ach_trade_100", "Floor Veteran", "Complete 100 trades", "trade_count", 100, 750, "Market Veteran"),
+                ("ach_work_200", "Career Grinder", "Complete 200 shifts", "work_count", 200, 900, "Work Legend"),
+            ]
+            cursor.executemany(
+                "INSERT OR IGNORE INTO achievements(ach_key, title, description, metric_key, target_value, reward_cash, reward_badge) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ach_seed,
+            )
+
+            # Ensure one active season exists
+            cursor.execute("SELECT COUNT(*) FROM season_meta WHERE status = 'active'")
+            if cursor.fetchone()[0] == 0:
+                now = int(time.time())
+                cursor.execute(
+                    "INSERT INTO season_meta(name, starts_at, ends_at, status) VALUES (?, ?, ?, 'active')",
+                    (f"Season {time.strftime('%Y-%m')}", now, now + 30 * 86400),
+                )
+
+            _set_user_version(3)
             conn.commit()
     except Exception:
         conn.rollback()

@@ -267,3 +267,127 @@ def housing_expense(housing: str) -> float:
 def get_all_citizens():
     cursor.execute("SELECT user_id FROM citizens")
     return [r[0] for r in cursor.fetchall()]
+
+
+def get_active_season():
+    cursor.execute(
+        "SELECT season_id, name, starts_at, ends_at FROM season_meta WHERE status = 'active' ORDER BY season_id DESC LIMIT 1"
+    )
+    return cursor.fetchone()
+
+
+def update_season_stat(user_id: int, metric: str, amount: float):
+    season = get_active_season()
+    if not season:
+        return
+    season_id = int(season[0])
+    cursor.execute(
+        "INSERT OR IGNORE INTO season_stats(season_id, user_id, updated_at) VALUES (?, ?, ?)",
+        (season_id, int(user_id), int(time.time())),
+    )
+    allowed = {"net_worth", "trade_volume", "work_shifts", "quests_completed"}
+    if metric not in allowed:
+        return
+    if metric in {"work_shifts", "quests_completed"}:
+        cursor.execute(
+            f"UPDATE season_stats SET {metric} = {metric} + ?, updated_at = ? WHERE season_id = ? AND user_id = ?",
+            (int(amount), int(time.time()), season_id, int(user_id)),
+        )
+    else:
+        cursor.execute(
+            f"UPDATE season_stats SET {metric} = {metric} + ?, updated_at = ? WHERE season_id = ? AND user_id = ?",
+            (float(amount), int(time.time()), season_id, int(user_id)),
+        )
+    conn.commit()
+
+
+def increment_quest_progress(user_id: int, target_type: str, delta: float = 1.0):
+    cursor.execute(
+        "UPDATE user_quests SET progress = MIN(target, progress + ?) "
+        "WHERE user_id = ? AND target_type = ? AND claimed = 0 AND resets_at > ?",
+        (float(delta), int(user_id), target_type, int(time.time())),
+    )
+    conn.commit()
+
+
+def ensure_user_achievements(user_id: int):
+    cursor.execute("SELECT ach_key, target_value FROM achievements")
+    for ach_key, target_value in cursor.fetchall():
+        cursor.execute(
+            "INSERT OR IGNORE INTO user_achievements(user_id, ach_key, progress) VALUES (?, ?, 0.0)",
+            (int(user_id), ach_key),
+        )
+    conn.commit()
+
+
+def increment_achievement_progress(user_id: int, metric_key: str, delta: float = 1.0):
+    ensure_user_achievements(user_id)
+    cursor.execute(
+        "SELECT ua.ach_key, ua.progress, ua.unlocked, a.target_value "
+        "FROM user_achievements ua JOIN achievements a ON ua.ach_key = a.ach_key "
+        "WHERE ua.user_id = ? AND a.metric_key = ?",
+        (int(user_id), metric_key),
+    )
+    rows = cursor.fetchall()
+    now = int(time.time())
+    for ach_key, progress, unlocked, target in rows:
+        new_progress = min(float(target), float(progress) + float(delta))
+        if unlocked:
+            cursor.execute(
+                "UPDATE user_achievements SET progress = ? WHERE user_id = ? AND ach_key = ?",
+                (new_progress, int(user_id), ach_key),
+            )
+        else:
+            will_unlock = 1 if new_progress >= float(target) else 0
+            unlock_ts = now if will_unlock else 0
+            cursor.execute(
+                "UPDATE user_achievements SET progress = ?, unlocked = ?, unlocked_at = CASE WHEN ? = 1 THEN ? ELSE unlocked_at END "
+                "WHERE user_id = ? AND ach_key = ?",
+                (new_progress, will_unlock, will_unlock, unlock_ts, int(user_id), ach_key),
+            )
+    conn.commit()
+
+
+def set_reminder_pref(user_id: int, dm_enabled: int = None, daily_ready: int = None, work_ready: int = None, quest_ready: int = None):
+    cursor.execute("INSERT OR IGNORE INTO reminder_prefs(user_id, updated_at) VALUES (?, ?)", (int(user_id), int(time.time())))
+    updates = []
+    params = []
+    if dm_enabled is not None:
+        updates.append("dm_enabled = ?")
+        params.append(int(bool(dm_enabled)))
+    if daily_ready is not None:
+        updates.append("daily_ready = ?")
+        params.append(int(bool(daily_ready)))
+    if work_ready is not None:
+        updates.append("work_ready = ?")
+        params.append(int(bool(work_ready)))
+    if quest_ready is not None:
+        updates.append("quest_ready = ?")
+        params.append(int(bool(quest_ready)))
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(int(time.time()))
+        params.append(int(user_id))
+        cursor.execute(f"UPDATE reminder_prefs SET {', '.join(updates)} WHERE user_id = ?", params)
+        conn.commit()
+
+
+def get_reminder_pref(user_id: int):
+    cursor.execute(
+        "SELECT dm_enabled, daily_ready, work_ready, quest_ready FROM reminder_prefs WHERE user_id = ?",
+        (int(user_id),),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {"dm_enabled": 0, "daily_ready": 1, "work_ready": 1, "quest_ready": 1}
+    return {"dm_enabled": int(row[0]), "daily_ready": int(row[1]), "work_ready": int(row[2]), "quest_ready": int(row[3])}
+
+
+def record_retention_metric(metric_name: str, metric_value: float, day_key: str = None):
+    if day_key is None:
+        day_key = time.strftime("%Y-%m-%d", time.gmtime())
+    cursor.execute(
+        "INSERT INTO retention_metrics(day_key, metric_name, metric_value, created_at) VALUES (?, ?, ?, ?)",
+        (day_key, metric_name, float(metric_value), int(time.time())),
+    )
+    conn.commit()

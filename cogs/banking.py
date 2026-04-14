@@ -2,7 +2,7 @@ import math
 import time
 import discord
 from discord.ext import commands
-from db import cursor, conn
+from db import cursor, write_txn
 from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
@@ -23,16 +23,17 @@ class Banking(commands.Cog):
             return
         amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
-        cursor.execute(
-            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
-            (amount, ctx.author.id, amount)
-        )
-        if cursor.rowcount == 0:
-            c = get_citizen(ctx.author.id)
-            await ctx.send(f"Insufficient cash. Wallet: {fmt(c['cash'])}")
-            return
-        cursor.execute("UPDATE citizens SET bank = bank + ? WHERE user_id = ?", (amount, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+                (amount, ctx.author.id, amount)
+            )
+            if cursor.rowcount == 0:
+                c = get_citizen(ctx.author.id)
+                await ctx.send(f"Insufficient cash. Wallet: {fmt(c['cash'])}")
+                return
+            cursor.execute("UPDATE citizens SET bank = bank + ? WHERE user_id = ?", (amount, ctx.author.id))
+        ctx._last_deposit_amount = float(amount)
         log_tx(ctx.author.id, "deposit", -amount, "Deposited to bank")
         c2 = get_citizen(ctx.author.id)
         await ctx.send(f"🏦 Deposited **{fmt(amount)}** to your bank.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
@@ -45,16 +46,16 @@ class Banking(commands.Cog):
             return
         amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
-        cursor.execute(
-            "UPDATE citizens SET bank = bank - ? WHERE user_id = ? AND bank >= ?",
-            (amount, ctx.author.id, amount)
-        )
-        if cursor.rowcount == 0:
-            c = get_citizen(ctx.author.id)
-            await ctx.send(f"Insufficient bank funds. Bank: {fmt(c['bank'])}")
-            return
-        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET bank = bank - ? WHERE user_id = ? AND bank >= ?",
+                (amount, ctx.author.id, amount)
+            )
+            if cursor.rowcount == 0:
+                c = get_citizen(ctx.author.id)
+                await ctx.send(f"Insufficient bank funds. Bank: {fmt(c['bank'])}")
+                return
+            cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, ctx.author.id))
         log_tx(ctx.author.id, "withdrawal", amount, "Withdrawn from bank")
         c2 = get_citizen(ctx.author.id)
         await ctx.send(f"💵 Withdrew **{fmt(amount)}** to your wallet.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
@@ -100,16 +101,16 @@ class Banking(commands.Cog):
         embed.set_footer(text="Loan is disbursed instantly — see details below.")
         await ctx.send(embed=embed)
 
-        cursor.execute(
-            "INSERT INTO loans(borrower_id, principal, remaining, interest_rate, weekly_payment, issued_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (ctx.author.id, amount, amount, rate, weekly_payment, int(time.time()))
-        )
-        cursor.execute("UPDATE citizens SET cash = cash + ?, debt = debt + ? WHERE user_id = ?",
-                       (amount, amount, ctx.author.id))
-        cursor.execute("UPDATE citizens SET credit_score = MAX(300, credit_score - 10) WHERE user_id = ?",
-                       (ctx.author.id,))
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "INSERT INTO loans(borrower_id, principal, remaining, interest_rate, weekly_payment, issued_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ctx.author.id, amount, amount, rate, weekly_payment, int(time.time()))
+            )
+            cursor.execute("UPDATE citizens SET cash = cash + ?, debt = debt + ? WHERE user_id = ?",
+                           (amount, amount, ctx.author.id))
+            cursor.execute("UPDATE citizens SET credit_score = MAX(300, credit_score - 10) WHERE user_id = ?",
+                           (ctx.author.id,))
         log_tx(ctx.author.id, "loan_received", amount, f"Loan at {rate*100:.2f}% interest")
         await ctx.send(f"✅ Loan of **{fmt(amount)}** disbursed to your wallet. Repay with `!repay <amount>`.")
 
@@ -138,19 +139,23 @@ class Banking(commands.Cog):
         actual = min(amount, remaining)
         new_remaining = round(remaining - actual, 2)
 
-        if new_remaining <= 0:
-            cursor.execute("UPDATE loans SET remaining = 0, status = 'paid' WHERE loan_id = ?", (loan_id,))
-            cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 25) WHERE user_id = ?", (ctx.author.id,))
-            status_msg = f"🎉 Loan fully repaid! Credit score improved."
-        else:
-            cursor.execute("UPDATE loans SET remaining = ?, last_payment = ? WHERE loan_id = ?",
-                           (new_remaining, int(time.time()), loan_id))
-            cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 5) WHERE user_id = ?", (ctx.author.id,))
-            status_msg = f"Remaining balance: {fmt(new_remaining)}"
-
-        cursor.execute("UPDATE citizens SET cash = cash - ?, debt = MAX(0, debt - ?) WHERE user_id = ?",
-                       (actual, actual, ctx.author.id))
-        conn.commit()
+        with write_txn():
+            cursor.execute(
+                "UPDATE citizens SET cash = cash - ?, debt = MAX(0, debt - ?) WHERE user_id = ? AND cash >= ?",
+                (actual, actual, ctx.author.id, actual),
+            )
+            if cursor.rowcount == 0:
+                await ctx.send("Repayment failed due to concurrent balance change. Please try again.")
+                return
+            if new_remaining <= 0:
+                cursor.execute("UPDATE loans SET remaining = 0, status = 'paid' WHERE loan_id = ?", (loan_id,))
+                cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 25) WHERE user_id = ?", (ctx.author.id,))
+                status_msg = f"🎉 Loan fully repaid! Credit score improved."
+            else:
+                cursor.execute("UPDATE loans SET remaining = ?, last_payment = ? WHERE loan_id = ?",
+                               (new_remaining, int(time.time()), loan_id))
+                cursor.execute("UPDATE citizens SET credit_score = MIN(850, credit_score + 5) WHERE user_id = ?", (ctx.author.id,))
+                status_msg = f"Remaining balance: {fmt(new_remaining)}"
         log_tx(ctx.author.id, "loan_repayment", -actual, f"Loan repayment")
         await ctx.send(f"✅ Repaid **{fmt(actual)}**. {status_msg}")
 
