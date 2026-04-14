@@ -1,9 +1,11 @@
 import re
 import time
+import math
 import discord
 from discord.ext import commands
 from db import cursor, conn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, add_gov_revenue
+from utils import safe_float, clamp, add_reputation
 
 BIZ_TYPES = {
     "retail":      {"name": "Retail Shop",          "cost": 5000,   "desc": "Buy and sell goods to customers"},
@@ -16,6 +18,7 @@ BIZ_TYPES = {
 
 EMPLOYEE_COST = 500
 MAX_EMPLOYEES = 50
+MAX_BIZ_TRANSFER = 1_000_000.0
 
 
 def get_biz(biz_id=None, owner_id=None, name=None):
@@ -110,16 +113,59 @@ class Business(commands.Cog):
         embed.add_field(name="Net Profit", value=profit_str, inline=True)
         embed.add_field(name="Employees", value=f"{biz['employees']}/{MAX_EMPLOYEES}", inline=True)
         embed.add_field(name="Public", value="Yes" if biz["is_public"] else "No", inline=True)
+        # Lightweight operating realism indicators
+        payroll_daily = biz["employees"] * (EMPLOYEE_COST * 0.25)
+        compliance = max(0.0, (biz["employees"] / 10) * 25.0)
+        embed.add_field(name="Estimated Payroll / Day", value=fmt(payroll_daily), inline=True)
+        embed.add_field(name="Compliance / Day", value=fmt(compliance), inline=True)
         if biz["is_public"]:
             embed.add_field(name="Share Price", value=fmt(biz["share_price"]), inline=True)
             embed.add_field(name="Shares Issued", value=str(biz["shares_issued"]), inline=True)
         await ctx.send(embed=embed)
 
     @commands.command()
+    async def bizops(self, ctx):
+        """Run an operating cycle for your business (payroll, compliance, small reputation drift)."""
+        ensure_citizen(ctx.author.id)
+        biz = get_biz(owner_id=ctx.author.id)
+        if not biz:
+            await ctx.send("You don't own a business.")
+            return
+
+        employees = int(biz["employees"])
+        if employees <= 0:
+            await ctx.send("Your business has no employees. Hire first with `!hire`.")
+            return
+
+        payroll = round(employees * (EMPLOYEE_COST * 0.25), 2)
+        compliance = round(max(0.0, (employees / 10) * 25.0), 2)
+        total = round(payroll + compliance, 2)
+
+        cursor.execute(
+            "UPDATE businesses SET cash = cash - ?, expenses = expenses + ? WHERE biz_id = ? AND cash >= ?",
+            (total, total, biz["biz_id"], total),
+        )
+        if cursor.rowcount == 0:
+            await ctx.send(f"Insufficient business reserves for ops. Needed: {fmt(total)}.")
+            return
+
+        # Small rep drift: paying ops on time increases rep slightly
+        rep_delta = clamp(0.5 + employees * 0.01, 0.5, 2.0)
+        cursor.execute("UPDATE businesses SET reputation = MIN(100, reputation + ?) WHERE biz_id = ?", (rep_delta, biz["biz_id"]))
+        conn.commit()
+        add_reputation("business", biz["biz_id"], rep_delta, reason="operations_cycle", source_type="bizops", source_id=str(ctx.author.id))
+
+        await ctx.send(f"✅ Operations cycle complete. Payroll: {fmt(payroll)} | Compliance: {fmt(compliance)} | Rep +{rep_delta:.2f}")
+
+    @commands.command()
     async def bizdeposit(self, ctx, amount: float):
         """Inject your own cash into your business. Usage: !bizdeposit <amount>"""
-        if amount <= 0:
-            await ctx.send("Amount must be positive.")
+        if not math.isfinite(amount) or amount <= 0:
+            await ctx.send("Amount must be a positive finite number.")
+            return
+        amount = round(amount, 2)
+        if amount > MAX_BIZ_TRANSFER:
+            await ctx.send(f"Maximum business deposit per transaction is {fmt(MAX_BIZ_TRANSFER)}.")
             return
         ensure_citizen(ctx.author.id)
         c = get_citizen(ctx.author.id)
@@ -139,8 +185,12 @@ class Business(commands.Cog):
     @commands.command()
     async def bizwithdraw(self, ctx, amount: float):
         """Withdraw profits from your business. Usage: !bizwithdraw <amount>"""
-        if amount <= 0:
-            await ctx.send("Amount must be positive.")
+        if not math.isfinite(amount) or amount <= 0:
+            await ctx.send("Amount must be a positive finite number.")
+            return
+        amount = round(amount, 2)
+        if amount > MAX_BIZ_TRANSFER:
+            await ctx.send(f"Maximum business withdrawal per transaction is {fmt(MAX_BIZ_TRANSFER)}.")
             return
         ensure_citizen(ctx.author.id)
         biz = get_biz(owner_id=ctx.author.id)

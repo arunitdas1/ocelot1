@@ -1,11 +1,14 @@
 import discord
 from discord.ext import commands
+import math
+import time
 from db import cursor, conn
 from utils import (
-    ensure_citizen, get_citizen, log_tx, fmt,
-    get_gov, set_gov, add_gov_revenue, deduct_gov_expense,
+    ensure_citizen, get_citizen, fmt,
+    get_gov, set_gov, deduct_gov_expense,
     get_eco_state, set_eco_state, get_all_citizens
 )
+from utils import clamp, safe_float
 
 
 class Government(commands.Cog):
@@ -41,6 +44,21 @@ class Government(commands.Cog):
         embed.add_field(name="💵 Minimum Wage", value=fmt(min_wage), inline=True)
         embed.add_field(name="👥 Citizens", value=str(citizens), inline=True)
         embed.add_field(name="🔴 Unemployed", value=str(unemployed), inline=True)
+        consumer = clamp(safe_float(get_eco_state("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
+        business = clamp(safe_float(get_eco_state("business_confidence") or 0.5, 0.5), 0.0, 1.0)
+        embed.add_field(name="Consumer confidence", value=f"{consumer*100:.0f}%", inline=True)
+        embed.add_field(name="Business confidence", value=f"{business*100:.0f}%", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def stabilizers(self, ctx):
+        """View automatic stabilizers (policy stances)."""
+        fiscal = safe_float(get_eco_state("policy_fiscal_stance") or 0.0, 0.0)
+        monetary = safe_float(get_eco_state("policy_monetary_stance") or 0.0, 0.0)
+        embed = discord.Embed(title="Automatic Stabilizers", color=discord.Color.blurple())
+        embed.description = "These values are used by the simulation to dampen extreme booms/busts."
+        embed.add_field(name="Fiscal stance", value=f"{fiscal:+.2f}", inline=True)
+        embed.add_field(name="Monetary stance", value=f"{monetary:+.2f}", inline=True)
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -49,9 +67,10 @@ class Government(commands.Cog):
         if not self._is_admin(ctx):
             await ctx.send("You need administrator permissions to use this command.")
             return
-        if amount <= 0:
-            await ctx.send("Amount must be positive.")
+        if not math.isfinite(amount) or amount <= 0:
+            await ctx.send("Amount must be a positive finite number.")
             return
+        amount = round(amount, 2)
 
         reserves = get_gov("reserves")
         all_citizens = get_all_citizens()
@@ -61,12 +80,15 @@ class Government(commands.Cog):
             await ctx.send(f"Insufficient government reserves ({fmt(reserves)}) to pay {fmt(total_cost)} total.")
             return
 
+        ts = int(time.time())
         for uid in all_citizens:
             cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, uid))
-            log_tx(uid, "stimulus", amount, "Government stimulus payment")
-
-        conn.commit()
+            cursor.execute(
+                "INSERT INTO transactions(user_id, tx_type, amount, description, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (uid, "stimulus", amount, "Government stimulus payment", ts)
+            )
         deduct_gov_expense(total_cost)
+        conn.commit()
         await ctx.send(
             f"✅ Stimulus of **{fmt(amount)}** sent to all **{len(all_citizens)}** citizens.\n"
             f"Total cost: {fmt(total_cost)} | Remaining reserves: {fmt(reserves - total_cost)}"
@@ -78,8 +100,8 @@ class Government(commands.Cog):
         if not self._is_admin(ctx):
             await ctx.send("Administrator permissions required.")
             return
-        if amount < 0:
-            await ctx.send("Minimum wage cannot be negative.")
+        if not math.isfinite(amount) or amount < 0:
+            await ctx.send("Minimum wage must be a finite number and cannot be negative.")
             return
         set_eco_state("min_wage", amount)
         await ctx.send(f"✅ Minimum wage set to **{fmt(amount)}** per shift.")
@@ -89,6 +111,9 @@ class Government(commands.Cog):
         """[Admin] Set economic rates. Types: interest, inflation. Usage: !setrate <type> <value_percent>"""
         if not self._is_admin(ctx):
             await ctx.send("Administrator permissions required.")
+            return
+        if not math.isfinite(value):
+            await ctx.send("Rate value must be a finite number.")
             return
 
         rate_type = rate_type.lower()
@@ -181,7 +206,7 @@ class Government(commands.Cog):
         if not self._is_admin(ctx):
             await ctx.send("Administrator permissions required.")
             return
-        if amount <= 0 or amount > 1000000:
+        if not math.isfinite(amount) or amount <= 0 or amount > 1000000:
             await ctx.send("Amount must be between $1 and $1,000,000.")
             return
 

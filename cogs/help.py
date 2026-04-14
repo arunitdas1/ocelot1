@@ -14,6 +14,7 @@ class HelpView(discord.ui.View):
         self.pages = pages
         self.page_index = 0
         self._sync_buttons()
+        self.message = None
 
     def _sync_buttons(self):
         total = len(self.pages)
@@ -33,17 +34,17 @@ class HelpView(discord.ui.View):
         self._sync_buttons()
         await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
 
-    @discord.ui.button(label="Home", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Home", style=discord.ButtonStyle.secondary, emoji="🏠")
     async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page_index = 0
         await self._update(interaction)
 
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary, emoji="⬅️")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page_index = max(0, self.page_index - 1)
         await self._update(interaction)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.success, emoji="➡️")
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page_index = min(len(self.pages) - 1, self.page_index + 1)
         await self._update(interaction)
@@ -51,6 +52,11 @@ class HelpView(discord.ui.View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
 
 class Help(commands.Cog):
@@ -76,37 +82,48 @@ class Help(commands.Cog):
         pages = []
 
         intro = discord.Embed(
-            title="Ocelot Economy Help",
+            title="🧭 Ocelot Economy Help Center",
             description=(
-                f"Use `{prefix}help <command>` for details.\n"
-                f"Use the buttons below to move through command pages."
+                f"Use `{prefix}help <command>` for detailed usage.\n"
+                f"Use the buttons below to browse categories and command pages."
             ),
             color=discord.Color.blurple(),
         )
-        intro.add_field(name="Total Commands", value=str(total_commands), inline=True)
-        intro.add_field(name="Categories", value=str(len(categories)), inline=True)
-        intro.set_footer(text="Page 1")
+        intro.add_field(name="📌 Total Commands", value=str(total_commands), inline=True)
+        intro.add_field(name="🗂️ Categories", value=str(len(categories)), inline=True)
+        intro.add_field(
+            name="Quick start",
+            value=f"`{prefix}start` → `{prefix}profile` → `{prefix}jobs` → `{prefix}apply <job_id>` → `{prefix}work`",
+            inline=False,
+        )
+        category_summary = "\n".join(
+            f"• **{cat}** — {len(grouped[cat])} commands"
+            for cat in categories
+        ) or "No categories found."
+        intro.add_field(name="Categories Overview", value=category_summary, inline=False)
         pages.append(intro)
 
-        current_page = 2
         for category in categories:
             commands_in_cat = grouped[category]
             commands_in_cat.sort(key=lambda c: c.name)
             for group in _chunk(commands_in_cat, 8):
                 embed = discord.Embed(
-                    title=f"{category} Commands",
+                    title=f"📚 {category} Commands",
                     color=discord.Color.blue(),
                 )
+                embed.description = f"Use `{prefix}help <command>` for syntax and details."
                 for cmd in group:
                     short_doc = cmd.short_doc or "No description provided."
                     embed.add_field(
-                        name=f"{prefix}{cmd.name}",
+                        name=f"🔹 `{prefix}{cmd.name}`",
                         value=short_doc,
                         inline=False,
                     )
-                embed.set_footer(text=f"Page {current_page}")
                 pages.append(embed)
-                current_page += 1
+
+        total_pages = len(pages)
+        for i, page in enumerate(pages, start=1):
+            page.set_footer(text=f"Page {i}/{total_pages} • Ocelot Economy")
 
         return pages
 
@@ -131,7 +148,7 @@ class Help(commands.Cog):
                 usage += f" {cmd.signature}"
 
             embed = discord.Embed(
-                title=f"Help: {prefix}{cmd.name}",
+                title=f"📘 Command Help: `{prefix}{cmd.name}`",
                 description=cmd.help or "No description provided.",
                 color=discord.Color.green(),
             )
@@ -139,12 +156,14 @@ class Help(commands.Cog):
             embed.add_field(name="Category", value=cmd.cog_name or "Other", inline=True)
             aliases = ", ".join(f"`{a}`" for a in cmd.aliases) if cmd.aliases else "None"
             embed.add_field(name="Aliases", value=aliases, inline=True)
+            embed.set_footer(text="Need more? Use !help to open the full menu.")
             await ctx.send(embed=embed)
             return
 
         pages = self._build_overview_pages(prefix)
         view = HelpView(ctx.author.id, pages)
-        await ctx.send(embed=pages[0], view=view)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
 
 async def setup(bot):

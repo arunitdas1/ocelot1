@@ -71,16 +71,20 @@ class Profile(commands.Cog):
         if not math.isfinite(amount) or amount <= 0:
             await ctx.send("Amount must be a positive finite number!")
             return
+        amount = round(amount, 2)
 
         ensure_citizen(ctx.author.id)
         ensure_citizen(member.id)
 
-        sender = get_citizen(ctx.author.id)
-        if sender["cash"] < amount:
+        cursor.execute(
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (amount, ctx.author.id, amount)
+        )
+        if cursor.rowcount == 0:
+            sender = get_citizen(ctx.author.id)
             await ctx.send(f"Insufficient funds! You only have {fmt(sender['cash'])} in your wallet.")
             return
 
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (amount, ctx.author.id))
         cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, member.id))
         conn.commit()
         log_tx(ctx.author.id, "payment_sent", -amount, f"Paid {member.display_name}")

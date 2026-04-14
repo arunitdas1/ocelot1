@@ -7,7 +7,7 @@ from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     calculate_income_tax, get_job_level,
     EDUCATION_LEVELS, EDUCATION_COSTS, EDUCATION_SALARY_BONUS,
-    add_gov_revenue, get_eco_state
+    add_gov_revenue, get_eco_state, safe_float, clamp, record_employment_event
 )
 
 JOBS = {
@@ -173,10 +173,16 @@ class Jobs(commands.Cog):
 
         lvl_num, lvl_title, multiplier, next_xp = get_job_level(c["job_xp"])
         edu_bonus = EDUCATION_SALARY_BONUS.get(c["education"], 1.0)
-        inflation = float(get_eco_state("inflation_rate") or 0.02)
+        inflation = safe_float(get_eco_state("inflation_rate") or 0.02, 0.02)
+        consumer_conf = clamp(safe_float(get_eco_state("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
+        phase = get_eco_state("economic_phase") or "stable"
 
         gross = random.uniform(j["salary"][0], j["salary"][1])
-        gross *= multiplier * edu_bonus * (1 + inflation * 5)
+        # Balanced realism: inflation affects nominal wages modestly; confidence + phase affect hours/bonuses.
+        nominal_adj = 1.0 + clamp(inflation, -0.05, 0.5) * 1.2
+        phase_adj = {"boom": 1.08, "stable": 1.0, "recession": 0.92, "depression": 0.85}.get(phase, 1.0)
+        conf_adj = 0.9 + consumer_conf * 0.2
+        gross *= multiplier * edu_bonus * nominal_adj * phase_adj * conf_adj
         gross = round(gross, 2)
 
         tax = calculate_income_tax(gross)
@@ -190,6 +196,7 @@ class Jobs(commands.Cog):
         conn.commit()
         add_gov_revenue(tax)
         log_tx(ctx.author.id, "salary", net, f"{j['name']} shift pay (after tax)")
+        record_employment_event(ctx.author.id, "worked", c["job_id"], f"net={net}")
 
         work_line = random.choice(WORK_LINES.get(c["job_id"], ["You completed your shift"]))
 

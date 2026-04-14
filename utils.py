@@ -1,4 +1,6 @@
 import time
+import json
+import math
 from db import cursor, conn
 
 EDUCATION_LEVELS = ["none", "highschool", "college", "masters", "phd"]
@@ -50,6 +52,115 @@ def log_tx(user_id: int, tx_type: str, amount: float, description: str):
 
 def fmt(amount: float) -> str:
     return f"${amount:,.2f}"
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        x = float(value)
+        if not math.isfinite(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def safe_json_loads(s: str, default):
+    try:
+        return json.loads(s) if s else default
+    except Exception:
+        return default
+
+
+def get_trust(src_user_id: int, dst_user_id: int) -> float:
+    cursor.execute(
+        "SELECT trust_score FROM trust_edges WHERE src_user_id = ? AND dst_user_id = ?",
+        (src_user_id, dst_user_id)
+    )
+    row = cursor.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def update_trust(src_user_id: int, dst_user_id: int, delta: float, reason: str = None):
+    now = int(time.time())
+    cursor.execute(
+        "SELECT trust_score, interactions FROM trust_edges WHERE src_user_id = ? AND dst_user_id = ?",
+        (src_user_id, dst_user_id)
+    )
+    row = cursor.fetchone()
+    if row:
+        score, interactions = float(row[0]), int(row[1])
+    else:
+        score, interactions = 0.0, 0
+    new_score = clamp(score + float(delta), -1.0, 1.0)
+    cursor.execute(
+        "INSERT OR REPLACE INTO trust_edges(src_user_id, dst_user_id, trust_score, interactions, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (src_user_id, dst_user_id, new_score, interactions + 1, now)
+    )
+    if reason:
+        cursor.execute(
+            "INSERT INTO reputation_ledger(entity_type, entity_id, delta, reason, source_type, source_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("citizen", dst_user_id, float(delta), reason, "trust", str(src_user_id), now)
+        )
+    conn.commit()
+
+
+def add_reputation(entity_type: str, entity_id: int, delta: float, reason: str = None, source_type: str = None, source_id: str = None):
+    now = int(time.time())
+    cursor.execute(
+        "INSERT INTO reputation_ledger(entity_type, entity_id, delta, reason, source_type, source_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (entity_type, int(entity_id), float(delta), reason, source_type, source_id, now)
+    )
+    conn.commit()
+
+
+def get_housing_tiers():
+    cursor.execute("SELECT tier, base_rent, upkeep, comfort, supply FROM housing_units ORDER BY base_rent ASC")
+    return cursor.fetchall()
+
+
+def housing_cost_for_tier(tier: str) -> tuple[float, float, float]:
+    cursor.execute("SELECT base_rent, upkeep, comfort FROM housing_units WHERE tier = ? LIMIT 1", (tier,))
+    row = cursor.fetchone()
+    if not row:
+        return 200.0, 20.0, 0.7
+    return float(row[0]), float(row[1]), float(row[2])
+
+
+def record_employment_event(user_id: int, event_type: str, job_id: str = None, details: str = None):
+    cursor.execute(
+        "INSERT INTO employment_history(user_id, event_type, job_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (int(user_id), event_type, job_id, details, int(time.time()))
+    )
+    conn.commit()
+
+
+def record_offense(offender_id: int, offense_type: str, severity: int, fine_amount: float, jail_seconds: int, detected_prob: float):
+    cursor.execute(
+        "INSERT INTO offenses(offender_id, offense_type, severity, fine_amount, jail_seconds, detected_prob_snapshot, committed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(offender_id), offense_type, int(severity), float(fine_amount), int(jail_seconds), float(detected_prob), int(time.time()))
+    )
+    conn.commit()
+
+
+def snapshot_macro(**kwargs):
+    ts = int(time.time())
+    cols = [
+        "ts", "inflation", "base_interest", "unemployment", "gdp_proxy", "money_supply", "velocity_proxy",
+        "avg_credit_score", "gov_reserves", "active_loans", "active_businesses", "bankrupt_businesses", "defaults_last_7d"
+    ]
+    values = [ts] + [kwargs.get(k) for k in cols[1:]]
+    cursor.execute(
+        f"INSERT OR REPLACE INTO macro_snapshots({', '.join(cols)}) VALUES ({', '.join(['?'] * len(cols))})",
+        values
+    )
+    conn.commit()
 
 
 def calculate_income_tax(gross: float) -> float:

@@ -3,6 +3,10 @@ from discord.ext import commands
 from db import cursor, conn
 from utils import ensure_citizen, get_citizen, log_tx, fmt
 from cogs.business import get_biz
+import math
+
+MAX_IPO_SHARE_PRICE = 10000.0
+MAX_SHARE_TRADE_QTY = 100000
 
 
 def get_portfolio(user_id, biz_id):
@@ -44,11 +48,14 @@ class Stocks(commands.Cog):
     @commands.command()
     async def ipo(self, ctx, shares: int, price: float):
         """List your business on the stock exchange. Usage: !ipo <shares> <price_per_share>"""
-        if shares <= 0 or price <= 0:
+        if shares <= 0 or not math.isfinite(price) or price <= 0:
             await ctx.send("Shares and price must be positive.")
             return
         if shares > 1000000:
             await ctx.send("Maximum IPO shares: 1,000,000.")
+            return
+        if price > MAX_IPO_SHARE_PRICE:
+            await ctx.send(f"IPO share price cannot exceed {fmt(MAX_IPO_SHARE_PRICE)}.")
             return
 
         ensure_citizen(ctx.author.id)
@@ -68,10 +75,10 @@ class Stocks(commands.Cog):
             await ctx.send(f"Your business needs {fmt(ipo_cost)} to cover IPO fees.")
             return
 
-        proceeds = shares * price
+        # IPO should not mint money upfront; funds arrive only when shares are sold.
         cursor.execute(
-            "UPDATE businesses SET is_public = 1, shares_issued = ?, share_price = ?, cash = cash - ? + ? WHERE biz_id = ?",
-            (shares, price, ipo_cost, proceeds, biz["biz_id"])
+            "UPDATE businesses SET is_public = 1, shares_issued = ?, share_price = ?, cash = cash - ? WHERE biz_id = ?",
+            (shares, price, ipo_cost, biz["biz_id"])
         )
         cursor.execute(
             "INSERT OR IGNORE INTO portfolios(user_id, biz_id, shares, avg_buy_price) VALUES (?, ?, 0, 0)",
@@ -81,7 +88,7 @@ class Stocks(commands.Cog):
         await ctx.send(
             f"🎉 **{biz['name']}** has gone public!\n"
             f"{shares:,} shares listed at {fmt(price)}/share.\n"
-            f"Market Cap: **{fmt(proceeds)}** | IPO fee: {fmt(ipo_cost)}"
+            f"Potential market cap: **{fmt(shares * price)}** | IPO fee: {fmt(ipo_cost)}"
         )
 
     @commands.command()
@@ -89,6 +96,9 @@ class Stocks(commands.Cog):
         """Buy shares in a public company. Usage: !invest <biz_name> <shares>"""
         if shares <= 0:
             await ctx.send("Share quantity must be positive.")
+            return
+        if shares > MAX_SHARE_TRADE_QTY:
+            await ctx.send(f"Max shares per trade is {MAX_SHARE_TRADE_QTY:,}.")
             return
 
         ensure_citizen(ctx.author.id)
@@ -118,7 +128,16 @@ class Stocks(commands.Cog):
         new_shares = current_shares + shares
         new_avg = round(((current_shares * avg_price) + total_cost) / new_shares, 4)
 
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (total_cost, ctx.author.id))
+        cursor.execute(
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (total_cost, ctx.author.id, total_cost)
+        )
+        if cursor.rowcount == 0:
+            latest = get_citizen(ctx.author.id)
+            await ctx.send(f"Insufficient funds. Cost: {fmt(total_cost)}. Wallet: {fmt(latest['cash'])}.")
+            return
+        # IPO share purchases fund the business treasury.
+        cursor.execute("UPDATE businesses SET cash = cash + ? WHERE biz_id = ?", (total_cost, biz["biz_id"]))
         cursor.execute(
             "INSERT OR REPLACE INTO portfolios(user_id, biz_id, shares, avg_buy_price) VALUES (?, ?, ?, ?)",
             (ctx.author.id, biz["biz_id"], new_shares, new_avg)
@@ -139,6 +158,9 @@ class Stocks(commands.Cog):
         """Sell shares you own. Usage: !divest <biz_name> <shares>"""
         if shares <= 0:
             await ctx.send("Share quantity must be positive.")
+            return
+        if shares > MAX_SHARE_TRADE_QTY:
+            await ctx.send(f"Max shares per trade is {MAX_SHARE_TRADE_QTY:,}.")
             return
 
         ensure_citizen(ctx.author.id)

@@ -2,7 +2,7 @@ import time
 import discord
 from discord.ext import commands
 from db import cursor, conn
-from utils import ensure_citizen, get_citizen, log_tx, fmt, get_eco_state, add_gov_revenue
+from utils import ensure_citizen, get_citizen, log_tx, fmt, get_eco_state, add_gov_revenue, get_trust, clamp
 
 CATEGORIES = ["food", "materials", "tech", "energy", "luxury"]
 
@@ -113,7 +113,14 @@ class Market(commands.Cog):
             )
             return
 
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (total, ctx.author.id))
+        cursor.execute(
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (total, ctx.author.id, total)
+        )
+        if cursor.rowcount == 0:
+            latest = get_citizen(ctx.author.id)
+            await ctx.send(f"Not enough cash. Total: {fmt(total)}. Wallet: {fmt(latest['cash'])}.")
+            return
         cursor.execute(
             "UPDATE market_goods SET supply = supply - ?, demand = demand + ? WHERE good_id = ?",
             (quantity, quantity // 2 + 1, good_id)
@@ -192,9 +199,19 @@ class Market(commands.Cog):
             await ctx.send(f"Not enough cash. Total: {fmt(grand)}. You have {fmt(c['cash'])}.")
             return
 
-        seller_gets = round(total * 0.95, 2)
+        # Trust-aware platform fee (balanced): low trust pays higher fees, high trust pays slightly less.
+        trust = get_trust(ctx.author.id, seller_id)
+        platform_fee = clamp(0.05 + (0.2 - trust) * 0.03, 0.03, 0.08)
+        seller_gets = round(total * (1.0 - platform_fee), 2)
 
-        cursor.execute("UPDATE citizens SET cash = cash - ? WHERE user_id = ?", (grand, ctx.author.id))
+        cursor.execute(
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (grand, ctx.author.id, grand)
+        )
+        if cursor.rowcount == 0:
+            latest = get_citizen(ctx.author.id)
+            await ctx.send(f"Not enough cash. Total: {fmt(grand)}. You have {fmt(latest['cash'])}.")
+            return
         cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (seller_gets, seller_id))
         cursor.execute("DELETE FROM market_listings WHERE listing_id = ?", (lid,))
         update_inventory(ctx.author.id, good_id, qty)
@@ -203,7 +220,10 @@ class Market(commands.Cog):
         log_tx(ctx.author.id, "p2p_buy", -grand, f"Bought {qty}x {good['name']} from player listing")
         log_tx(seller_id, "p2p_sell", seller_gets, f"Sold {qty}x {good['name']} via listing")
 
-        await ctx.send(f"✅ Purchased **{qty}x {good['name']}** for {fmt(grand)} (including 8% tax + 5% platform fee).")
+        await ctx.send(
+            f"✅ Purchased **{qty}x {good['name']}** for {fmt(grand)} "
+            f"(includes 8% tax + {platform_fee*100:.1f}% platform fee)."
+        )
 
     @commands.command()
     async def listings(self, ctx, category: str = None):

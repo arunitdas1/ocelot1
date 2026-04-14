@@ -20,13 +20,17 @@ class Banking(commands.Cog):
         if not math.isfinite(amount) or amount <= 0:
             await ctx.send("Amount must be a positive finite number.")
             return
+        amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
-        c = get_citizen(ctx.author.id)
-        if c["cash"] < amount:
+        cursor.execute(
+            "UPDATE citizens SET cash = cash - ? WHERE user_id = ? AND cash >= ?",
+            (amount, ctx.author.id, amount)
+        )
+        if cursor.rowcount == 0:
+            c = get_citizen(ctx.author.id)
             await ctx.send(f"Insufficient cash. Wallet: {fmt(c['cash'])}")
             return
-        cursor.execute("UPDATE citizens SET cash = cash - ?, bank = bank + ? WHERE user_id = ?",
-                       (amount, amount, ctx.author.id))
+        cursor.execute("UPDATE citizens SET bank = bank + ? WHERE user_id = ?", (amount, ctx.author.id))
         conn.commit()
         log_tx(ctx.author.id, "deposit", -amount, "Deposited to bank")
         c2 = get_citizen(ctx.author.id)
@@ -38,13 +42,17 @@ class Banking(commands.Cog):
         if not math.isfinite(amount) or amount <= 0:
             await ctx.send("Amount must be a positive finite number.")
             return
+        amount = round(amount, 2)
         ensure_citizen(ctx.author.id)
-        c = get_citizen(ctx.author.id)
-        if c["bank"] < amount:
+        cursor.execute(
+            "UPDATE citizens SET bank = bank - ? WHERE user_id = ? AND bank >= ?",
+            (amount, ctx.author.id, amount)
+        )
+        if cursor.rowcount == 0:
+            c = get_citizen(ctx.author.id)
             await ctx.send(f"Insufficient bank funds. Bank: {fmt(c['bank'])}")
             return
-        cursor.execute("UPDATE citizens SET bank = bank - ?, cash = cash + ? WHERE user_id = ?",
-                       (amount, amount, ctx.author.id))
+        cursor.execute("UPDATE citizens SET cash = cash + ? WHERE user_id = ?", (amount, ctx.author.id))
         conn.commit()
         log_tx(ctx.author.id, "withdrawal", amount, "Withdrawn from bank")
         c2 = get_citizen(ctx.author.id)
