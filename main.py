@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from keep_alive import keep_alive
-from db import active_events, citizens, event_participants, acquire_user_lock, release_user_lock
+from db import active_events, citizens, event_participants, acquire_user_lock, release_user_lock, test_connection
 from utils import (
     get_eco_state,
     get_eco_states,
@@ -155,6 +155,7 @@ COGS = [
 
 @bot.event
 async def on_ready():
+    test_connection()
     print(f"{bot.user} is online and the economy is running!")
 
 
