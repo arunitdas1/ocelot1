@@ -6,6 +6,7 @@ from discord.ext import commands
 from db import cursor, conn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, add_gov_revenue
 from utils import safe_float, clamp, add_reputation
+from cogs.ui_components import PaginatorView, ConfirmView
 
 BIZ_TYPES = {
     "retail":      {"name": "Retail Shop",          "cost": 5000,   "desc": "Buy and sell goods to customers"},
@@ -91,7 +92,7 @@ class Business(commands.Cog):
             f"Startup cost: {fmt(cost)}. Use `!mybiz` to manage it."
         )
 
-    @commands.command()
+    @commands.command(aliases=["mybusiness"])
     async def mybiz(self, ctx):
         """View your business stats."""
         ensure_citizen(ctx.author.id)
@@ -260,7 +261,7 @@ class Business(commands.Cog):
         conn.commit()
         await ctx.send(f"Employee laid off. **{biz['name']}** now has {new_count} employees.")
 
-    @commands.command()
+    @commands.command(aliases=["businesses"])
     async def bizlist(self, ctx):
         """View all active businesses."""
         cursor.execute(
@@ -272,15 +273,24 @@ class Business(commands.Cog):
             await ctx.send("No businesses registered yet. Use `!startbiz` to found one!")
             return
 
-        embed = discord.Embed(title="🏢 Business Directory", color=discord.Color.dark_teal())
-        for biz_id, name, btype, emp, rep, cash, is_pub in rows:
-            pub_tag = " 📈" if is_pub else ""
-            embed.add_field(
-                name=f"{name}{pub_tag}",
-                value=f"Type: {btype.title()} | Employees: {emp} | Rep: {rep}/100 | Reserves: {fmt(cash)}",
-                inline=False
-            )
-        await ctx.send(embed=embed)
+        pages = []
+        chunk_size = 6
+        for idx in range(0, len(rows), chunk_size):
+            embed = discord.Embed(title="🏢 Business Directory", color=discord.Color.dark_teal())
+            for biz_id, name, btype, emp, rep, cash, is_pub in rows[idx:idx + chunk_size]:
+                pub_tag = " 📈" if is_pub else ""
+                embed.add_field(
+                    name=f"{name}{pub_tag}",
+                    value=f"Type: {btype.title()} | Employees: {emp} | Rep: {rep}/100 | Reserves: {fmt(cash)}",
+                    inline=False
+                )
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
     @commands.command()
     async def closebiz(self, ctx):
@@ -289,6 +299,18 @@ class Business(commands.Cog):
         biz = get_biz(owner_id=ctx.author.id)
         if not biz:
             await ctx.send("You don't own a business.")
+            return
+
+        confirm = ConfirmView(ctx.author.id)
+        prompt = discord.Embed(
+            title="Confirm Business Closure",
+            description=f"Close **{biz['name']}** permanently?\nYou will receive 50% of reserves as liquidation.",
+            color=discord.Color.red(),
+        )
+        msg = await ctx.send(embed=prompt, view=confirm)
+        await confirm.wait()
+        if confirm.value is not True:
+            await ctx.send("Business closure cancelled.")
             return
 
         liquidation = round(biz["cash"] * 0.5, 2)

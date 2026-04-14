@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import math
 import time
+import os
 from db import cursor, conn
 from utils import (
     ensure_citizen, get_citizen, fmt,
@@ -9,16 +10,23 @@ from utils import (
     get_eco_state, set_eco_state, get_all_citizens
 )
 from utils import clamp, safe_float
+from cogs.ui_components import ConfirmView
 
 
 class Government(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.owner_fallback_id = int(os.getenv("OWNER_ID", "0") or 0)
 
-    def _is_admin(self, ctx):
-        return ctx.author.guild_permissions.administrator if ctx.guild else False
+    async def _is_admin(self, ctx):
+        if self.owner_fallback_id and ctx.author.id == self.owner_fallback_id:
+            return True
+        try:
+            return await self.bot.is_owner(ctx.author)
+        except Exception:
+            return False
 
-    @commands.command()
+    @commands.command(aliases=["budgetreport"])
     async def govbudget(self, ctx):
         """View the government's budget and reserves."""
         revenue = get_gov("revenue")
@@ -61,12 +69,11 @@ class Government(commands.Cog):
         embed.add_field(name="Monetary stance", value=f"{monetary:+.2f}", inline=True)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.command(hidden=True)
     async def stimulus(self, ctx, amount: float):
         """[Admin] Issue a stimulus payment to all citizens."""
-        if not self._is_admin(ctx):
-            await ctx.send("You need administrator permissions to use this command.")
-            return
+        if not await self._is_admin(ctx):
+            raise commands.CommandNotFound()
         if not math.isfinite(amount) or amount <= 0:
             await ctx.send("Amount must be a positive finite number.")
             return
@@ -94,24 +101,22 @@ class Government(commands.Cog):
             f"Total cost: {fmt(total_cost)} | Remaining reserves: {fmt(reserves - total_cost)}"
         )
 
-    @commands.command()
+    @commands.command(hidden=True)
     async def setminwage(self, ctx, amount: float):
         """[Admin] Set the minimum wage per shift."""
-        if not self._is_admin(ctx):
-            await ctx.send("Administrator permissions required.")
-            return
+        if not await self._is_admin(ctx):
+            raise commands.CommandNotFound()
         if not math.isfinite(amount) or amount < 0:
             await ctx.send("Minimum wage must be a finite number and cannot be negative.")
             return
         set_eco_state("min_wage", amount)
         await ctx.send(f"✅ Minimum wage set to **{fmt(amount)}** per shift.")
 
-    @commands.command()
+    @commands.command(hidden=True)
     async def setrate(self, ctx, rate_type: str, value: float):
         """[Admin] Set economic rates. Types: interest, inflation. Usage: !setrate <type> <value_percent>"""
-        if not self._is_admin(ctx):
-            await ctx.send("Administrator permissions required.")
-            return
+        if not await self._is_admin(ctx):
+            raise commands.CommandNotFound()
         if not math.isfinite(value):
             await ctx.send("Rate value must be a finite number.")
             return
@@ -134,12 +139,11 @@ class Government(commands.Cog):
         else:
             await ctx.send("Unknown rate type. Use `interest` or `inflation`.")
 
-    @commands.command()
+    @commands.command(hidden=True)
     async def setphase(self, ctx, phase: str):
         """[Admin] Manually set economic phase: boom, stable, recession, depression."""
-        if not self._is_admin(ctx):
-            await ctx.send("Administrator permissions required.")
-            return
+        if not await self._is_admin(ctx):
+            raise commands.CommandNotFound()
 
         phase = phase.lower()
         valid = ["boom", "stable", "recession", "depression"]
@@ -200,14 +204,28 @@ class Government(commands.Cog):
             f"(distributed automatically by the economy engine). Use `!jobs` to find employment."
         )
 
-    @commands.command()
+    @commands.command(aliases=["moneyprint"], hidden=True)
     async def printmoney(self, ctx, amount: float):
         """[Admin] Inject money into the government reserves (simulates quantitative easing)."""
-        if not self._is_admin(ctx):
-            await ctx.send("Administrator permissions required.")
-            return
+        if not await self._is_admin(ctx):
+            raise commands.CommandNotFound()
         if not math.isfinite(amount) or amount <= 0 or amount > 1000000:
             await ctx.send("Amount must be between $1 and $1,000,000.")
+            return
+
+        confirm = ConfirmView(ctx.author.id)
+        prompt = discord.Embed(
+            title="Confirm Money Printing",
+            description=(
+                f"Print **{fmt(amount)}** into reserves?\n"
+                "This action can increase inflation."
+            ),
+            color=discord.Color.orange(),
+        )
+        msg = await ctx.send(embed=prompt, view=confirm)
+        await confirm.wait()
+        if confirm.value is not True:
+            await ctx.send("Money printing cancelled.")
             return
 
         reserves = get_gov("reserves")

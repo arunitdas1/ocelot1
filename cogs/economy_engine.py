@@ -239,6 +239,8 @@ class EconomyEngine(commands.Cog):
     async def trigger_events(self):
         """Randomly trigger economic events."""
         try:
+            if (get_eco_state("events_enabled") or "1") != "1":
+                return
             now = int(time.time())
             cursor.execute("SELECT COUNT(*) FROM active_events WHERE ends_at > ?", (now,))
             active_count = cursor.fetchone()[0]

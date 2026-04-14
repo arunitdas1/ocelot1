@@ -4,6 +4,7 @@ from db import cursor, conn
 from utils import ensure_citizen, get_citizen, log_tx, fmt
 from cogs.business import get_biz
 import math
+from cogs.ui_components import PaginatorView
 
 MAX_IPO_SHARE_PRICE = 10000.0
 MAX_SHARE_TRADE_QTY = 100000
@@ -19,7 +20,7 @@ class Stocks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
+    @commands.command(aliases=["exchange"])
     async def stocks(self, ctx):
         """View all publicly listed companies on the stock exchange."""
         cursor.execute(
@@ -31,19 +32,28 @@ class Stocks(commands.Cog):
             await ctx.send("No companies are publicly listed yet. Business owners can use `!ipo` to go public.")
             return
 
-        embed = discord.Embed(title="📈 Stock Exchange", color=discord.Color.green())
-        embed.description = "Use `!invest <biz_name> <shares>` to buy stock."
-        for biz_id, name, btype, price, shares, revenue, rep in rows:
-            market_cap = price * shares
-            embed.add_field(
-                name=f"{name} ({btype.title()})",
-                value=(
-                    f"Price: **{fmt(price)}** | Market Cap: {fmt(market_cap)}\n"
-                    f"Shares: {shares:,} | Revenue: {fmt(revenue)} | Rep: {rep}/100"
-                ),
-                inline=False
-            )
-        await ctx.send(embed=embed)
+        pages = []
+        chunk_size = 6
+        for idx in range(0, len(rows), chunk_size):
+            embed = discord.Embed(title="📈 Stock Exchange", color=discord.Color.green())
+            embed.description = "Use `!invest <biz_name> <shares>` to buy stock."
+            for biz_id, name, btype, price, shares, revenue, rep in rows[idx:idx + chunk_size]:
+                market_cap = price * shares
+                embed.add_field(
+                    name=f"{name} ({btype.title()})",
+                    value=(
+                        f"Price: **{fmt(price)}** | Market Cap: {fmt(market_cap)}\n"
+                        f"Shares: {shares:,} | Revenue: {fmt(revenue)} | Rep: {rep}/100"
+                    ),
+                    inline=False
+                )
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
     @commands.command()
     async def ipo(self, ctx, shares: int, price: float):
@@ -201,7 +211,7 @@ class Stocks(commands.Cog):
             f"Proceeds: {fmt(proceeds)} | P&L: {gl_str} | Capital Gains Tax: {fmt(capital_gains_tax)} | Net: {fmt(net_proceeds)}"
         )
 
-    @commands.command()
+    @commands.command(aliases=["pf"])
     async def portfolio(self, ctx, member: discord.Member = None):
         """View your stock portfolio."""
         target = member or ctx.author
@@ -220,7 +230,7 @@ class Stocks(commands.Cog):
 
         total_value = 0.0
         total_cost = 0.0
-        embed = discord.Embed(title=f"📊 {target.display_name}'s Portfolio", color=discord.Color.gold())
+        position_lines = []
         for biz_id, name, shares, avg_buy, current_price in rows:
             value = shares * current_price
             cost = shares * avg_buy
@@ -228,17 +238,30 @@ class Stocks(commands.Cog):
             gl_str = f"+{fmt(gl)}" if gl >= 0 else fmt(gl)
             total_value += value
             total_cost += cost
-            embed.add_field(
-                name=f"{name} — {shares:,} shares",
-                value=f"Avg: {fmt(avg_buy)} | Current: {fmt(current_price)} | Value: {fmt(value)} | P&L: {gl_str}",
-                inline=False
-            )
+            position_lines.append((name, shares, avg_buy, current_price, value, gl_str))
 
         total_gl = total_value - total_cost
-        gl_str = f"+{fmt(total_gl)}" if total_gl >= 0 else fmt(total_gl)
-        embed.add_field(name="📈 Total Portfolio Value", value=fmt(total_value), inline=True)
-        embed.add_field(name="Total P&L", value=gl_str, inline=True)
-        await ctx.send(embed=embed)
+        total_gl_str = f"+{fmt(total_gl)}" if total_gl >= 0 else fmt(total_gl)
+        pages = []
+        chunk_size = 6
+        for idx in range(0, len(position_lines), chunk_size):
+            embed = discord.Embed(title=f"📊 {target.display_name}'s Portfolio", color=discord.Color.gold())
+            for name, shares, avg_buy, current_price, value, gl_str in position_lines[idx:idx + chunk_size]:
+                embed.add_field(
+                    name=f"{name} — {shares:,} shares",
+                    value=f"Avg: {fmt(avg_buy)} | Current: {fmt(current_price)} | Value: {fmt(value)} | P&L: {gl_str}",
+                    inline=False
+                )
+            embed.add_field(name="📈 Total Portfolio Value", value=fmt(total_value), inline=True)
+            embed.add_field(name="Total P&L", value=total_gl_str, inline=True)
+            pages.append(embed)
+
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
 
 async def setup(bot):

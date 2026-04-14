@@ -1,10 +1,12 @@
 import os
 import time
 import asyncio
+import difflib
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from keep_alive import keep_alive
+from utils import get_eco_state
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -38,6 +40,13 @@ COMMAND_COOLDOWNS = {
 _user_locks: dict[int, asyncio.Lock] = {}
 _active_ctx_locks: dict[int, asyncio.Lock] = {}
 _last_command_at: dict[tuple[int, str], float] = {}
+OWNER_FALLBACK_ID = int(os.getenv("OWNER_ID", "0") or 0)
+TRANSACTION_COMMANDS = {
+    "pay", "daily", "deposit", "withdraw", "loan", "repay",
+    "buy", "sell", "buyp2p", "delist", "invest", "divest",
+    "startbiz", "bizdeposit", "bizwithdraw", "hire", "fire", "closebiz",
+    "educate", "train", "work",
+}
 
 
 class OcelotContext(commands.Context):
@@ -131,6 +140,7 @@ COGS = [
     "cogs.legal",
     "cogs.finance",
     "cogs.onboarding",
+    "cogs.owner_admin",
 ]
 
 
@@ -145,6 +155,15 @@ async def _release_ctx_lock(ctx):
         lock.release()
 
 
+async def _is_owner_user(user: discord.abc.User) -> bool:
+    if OWNER_FALLBACK_ID and user.id == OWNER_FALLBACK_ID:
+        return True
+    try:
+        return await bot.is_owner(user)
+    except Exception:
+        return False
+
+
 @bot.before_invoke
 async def anti_abuse_guard(ctx):
     if not ctx.command:
@@ -152,6 +171,16 @@ async def anti_abuse_guard(ctx):
 
     cmd_name = ctx.command.qualified_name
     uid = ctx.author.id
+    is_owner = await _is_owner_user(ctx.author)
+
+    # Emergency toggles should not affect owner access.
+    maintenance_mode = (get_eco_state("maintenance_mode") or "0") == "1"
+    economy_frozen = (get_eco_state("economy_frozen") or "0") == "1"
+    if not is_owner and maintenance_mode:
+        # Generic unknown-style response to avoid exposing admin internals.
+        raise commands.CommandNotFound()
+    if not is_owner and economy_frozen and cmd_name in TRANSACTION_COMMANDS:
+        raise commands.CommandNotFound()
 
     if cmd_name not in EXEMPT_COMMANDS:
         now = time.monotonic()
@@ -197,9 +226,23 @@ async def on_command_error(ctx, error):
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.CommandNotFound):
-        pass
+        content = ctx.message.content.strip()
+        if content.startswith("!"):
+            attempted = content[1:].split(" ")[0].lower()
+            all_commands = [c.name for c in bot.commands if not c.hidden]
+            suggestion = difflib.get_close_matches(attempted, all_commands, n=1, cutoff=0.55)
+            if suggestion:
+                await ctx.send(f"Unknown command `{attempted}`. Did you mean `!{suggestion[0]}`?\nUse `!help` to browse commands.")
+            else:
+                await ctx.send(f"Unknown command `{attempted}`. Use `!help` to browse available commands.")
     elif isinstance(error, commands.CheckFailure) and str(error) == "Command rate-limited.":
         pass
+    elif isinstance(error, commands.CheckFailure):
+        # Hide protected commands from unauthorized users.
+        content = ctx.message.content.strip()
+        if content.startswith("!"):
+            attempted = content[1:].split(" ")[0].lower()
+            await ctx.send(f"Unknown command `{attempted}`. Use `!help` to browse available commands.")
     elif isinstance(error, commands.MissingPermissions):
         embed = discord.Embed(
             title="Permission denied",

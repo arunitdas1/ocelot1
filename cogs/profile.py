@@ -7,6 +7,7 @@ from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     EDUCATION_LEVELS, calculate_income_tax, housing_expense, get_eco_state
 )
+from cogs.ui_components import PaginatorView
 
 
 class Profile(commands.Cog):
@@ -151,18 +152,37 @@ class Profile(commands.Cog):
             await ctx.send("No citizens registered yet.")
             return
 
-        embed = discord.Embed(title="🏆 Wealth Leaderboard", color=discord.Color.gold())
         medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
         lines = []
         for i, (uid, net) in enumerate(rows):
-            try:
-                user = await self.bot.fetch_user(uid)
-                name = user.display_name
-            except Exception:
-                name = f"User {uid}"
+            # Prefer guild/member cache before API call for better latency.
+            member = ctx.guild.get_member(uid) if ctx.guild else None
+            if member:
+                name = member.display_name
+            else:
+                user = self.bot.get_user(uid)
+                if user:
+                    name = user.display_name
+                else:
+                    try:
+                        user = await self.bot.fetch_user(uid)
+                        name = user.display_name
+                    except Exception:
+                        name = f"User {uid}"
             lines.append(f"{medals[i]} **{name}** — {fmt(net)}")
-        embed.description = "\n".join(lines)
-        await ctx.send(embed=embed)
+
+        pages = []
+        chunk_size = 5
+        for idx in range(0, len(lines), chunk_size):
+            embed = discord.Embed(title="🏆 Wealth Leaderboard", color=discord.Color.gold())
+            embed.description = "\n".join(lines[idx:idx + chunk_size])
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
     @commands.command()
     async def history(self, ctx, limit: int = 10):
@@ -180,14 +200,24 @@ class Profile(commands.Cog):
             return
 
         import datetime
-        embed = discord.Embed(title="📜 Recent Transactions", color=discord.Color.blue())
         lines = []
         for tx_type, amount, desc, ts in rows:
             sign = "+" if amount >= 0 else ""
             dt = datetime.datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
             lines.append(f"`{dt}` {sign}{fmt(amount)} — {desc}")
-        embed.description = "\n".join(lines)
-        await ctx.send(embed=embed)
+        pages = []
+        chunk_size = 8
+        for idx in range(0, len(lines), chunk_size):
+            embed = discord.Embed(title="📜 Recent Transactions", color=discord.Color.blue())
+            embed.description = "\n".join(lines[idx:idx + chunk_size])
+            embed.set_footer(text="Tip: use !statement 30 for category summary.")
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
 
 async def setup(bot):

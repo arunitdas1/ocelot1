@@ -376,6 +376,32 @@ def _apply_migrations():
 
             _set_user_version(1)
             conn.commit()
+            v = 1
+
+        if v < 2:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at INTEGER DEFAULT 0
+            )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit(created_at)")
+
+            extra_defaults = {
+                "maintenance_mode": "0",
+                "economy_frozen": "0",
+                "events_enabled": "1",
+                "global_money_multiplier": "1.0",
+                "global_xp_multiplier": "1.0",
+            }
+            for k, val in extra_defaults.items():
+                cursor.execute("INSERT OR IGNORE INTO economy_state(key, value) VALUES (?, ?)", (k, val))
+
+            _set_user_version(2)
+            conn.commit()
     except Exception:
         conn.rollback()
         raise

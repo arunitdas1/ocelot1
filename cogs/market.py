@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from db import cursor, conn
 from utils import ensure_citizen, get_citizen, log_tx, fmt, get_eco_state, add_gov_revenue, get_trust, clamp
+from cogs.ui_components import PaginatorView, ConfirmView
 
 CATEGORIES = ["food", "materials", "tech", "energy", "luxury"]
 
@@ -23,22 +24,20 @@ def get_inventory(user_id, good_id):
 
 
 def update_inventory(user_id, good_id, delta):
-    current = get_inventory(user_id, good_id)
-    new_qty = current + delta
-    if new_qty <= 0:
-        cursor.execute("DELETE FROM inventories WHERE user_id = ? AND good_id = ?", (user_id, good_id))
-    else:
-        cursor.execute(
-            "INSERT OR REPLACE INTO inventories(user_id, good_id, quantity) VALUES (?, ?, ?)",
-            (user_id, good_id, new_qty)
-        )
+    # Single upsert path reduces one read query per inventory update.
+    cursor.execute(
+        "INSERT INTO inventories(user_id, good_id, quantity) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, good_id) DO UPDATE SET quantity = quantity + excluded.quantity",
+        (user_id, good_id, delta),
+    )
+    cursor.execute("DELETE FROM inventories WHERE user_id = ? AND good_id = ? AND quantity <= 0", (user_id, good_id))
 
 
 class Market(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
+    @commands.command(aliases=["shop", "prices"])
     async def market(self, ctx, category: str = None):
         """View market prices. Filter by category: food, materials, tech, energy, luxury"""
         if category and category.lower() not in CATEGORIES:
@@ -243,21 +242,38 @@ class Market(commands.Cog):
             await ctx.send("No active player listings.")
             return
 
-        embed = discord.Embed(title="🏷️ Player Market Listings", color=discord.Color.teal())
-        for lid, seller_id, name, qty, price, listed_at in rows[:15]:
-            try:
-                seller = await self.bot.fetch_user(seller_id)
-                seller_name = seller.display_name
-            except Exception:
-                seller_name = f"User {seller_id}"
-            embed.add_field(
-                name=f"#{lid} — {qty}x {name} @ {fmt(price)}/unit",
-                value=f"Seller: {seller_name} | Total: {fmt(qty * price)} | `!buyp2p {lid}`",
-                inline=False
-            )
-        await ctx.send(embed=embed)
+        pages = []
+        chunk_size = 8
+        for idx in range(0, min(len(rows), 30), chunk_size):
+            embed = discord.Embed(title="🏷️ Player Market Listings", color=discord.Color.teal())
+            for lid, seller_id, name, qty, price, listed_at in rows[idx:idx + chunk_size]:
+                member = ctx.guild.get_member(seller_id) if ctx.guild else None
+                if member:
+                    seller_name = member.display_name
+                else:
+                    user = self.bot.get_user(seller_id)
+                    if user:
+                        seller_name = user.display_name
+                    else:
+                        try:
+                            seller = await self.bot.fetch_user(seller_id)
+                            seller_name = seller.display_name
+                        except Exception:
+                            seller_name = f"User {seller_id}"
+                embed.add_field(
+                    name=f"#{lid} — {qty}x {name} @ {fmt(price)}/unit",
+                    value=f"Seller: {seller_name} | Total: {fmt(qty * price)} | `!buyp2p {lid}`",
+                    inline=False
+                )
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
-    @commands.command()
+    @commands.command(aliases=["inv", "bag"])
     async def inventory(self, ctx, member: discord.Member = None):
         """View your inventory."""
         target = member or ctx.author
@@ -274,20 +290,29 @@ class Market(commands.Cog):
             return
 
         total_value = sum(qty * price for _, _, qty, price in rows)
-        embed = discord.Embed(
-            title=f"🎒 {target.display_name}'s Inventory",
-            description=f"Estimated value: **{fmt(total_value)}**",
-            color=discord.Color.green()
-        )
-        for good_id, name, qty, price in rows:
-            embed.add_field(
-                name=f"{name} (x{qty})",
-                value=f"Market value: {fmt(price * qty)} | Use `!sell {good_id} {qty} <price>`",
-                inline=True
+        pages = []
+        chunk_size = 8
+        for idx in range(0, len(rows), chunk_size):
+            embed = discord.Embed(
+                title=f"🎒 {target.display_name}'s Inventory",
+                description=f"Estimated value: **{fmt(total_value)}**",
+                color=discord.Color.green()
             )
-        await ctx.send(embed=embed)
+            for good_id, name, qty, price in rows[idx:idx + chunk_size]:
+                embed.add_field(
+                    name=f"{name} (x{qty})",
+                    value=f"Market value: {fmt(price * qty)} | `!sell {good_id} {qty} <price>`",
+                    inline=True
+                )
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
-    @commands.command()
+    @commands.command(aliases=["unlist"])
     async def delist(self, ctx, listing_id: int):
         """Remove one of your active market listings. Usage: !delist <listing_id>"""
         cursor.execute(
@@ -297,6 +322,18 @@ class Market(commands.Cog):
         row = cursor.fetchone()
         if not row:
             await ctx.send("Listing not found or you don't own it.")
+            return
+
+        confirm = ConfirmView(ctx.author.id)
+        prompt = discord.Embed(
+            title="Confirm Delist",
+            description=f"Delist listing **#{listing_id}** and return items to your inventory?",
+            color=discord.Color.orange(),
+        )
+        msg = await ctx.send(embed=prompt, view=confirm)
+        await confirm.wait()
+        if confirm.value is not True:
+            await ctx.send("Delist cancelled.")
             return
 
         lid, good_id, qty = row

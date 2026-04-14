@@ -3,6 +3,7 @@ import time
 import discord
 from discord.ext import commands
 from db import cursor, conn
+from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     get_loan_interest_rate, credit_score_label,
@@ -14,7 +15,7 @@ class Banking(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
+    @commands.command(aliases=["dep"])
     async def deposit(self, ctx, amount: float):
         """Deposit cash from wallet into your bank. Usage: !deposit <amount>"""
         if not math.isfinite(amount) or amount <= 0:
@@ -36,7 +37,7 @@ class Banking(commands.Cog):
         c2 = get_citizen(ctx.author.id)
         await ctx.send(f"🏦 Deposited **{fmt(amount)}** to your bank.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
 
-    @commands.command()
+    @commands.command(aliases=["wd"])
     async def withdraw(self, ctx, amount: float):
         """Withdraw cash from your bank to wallet. Usage: !withdraw <amount>"""
         if not math.isfinite(amount) or amount <= 0:
@@ -58,7 +59,7 @@ class Banking(commands.Cog):
         c2 = get_citizen(ctx.author.id)
         await ctx.send(f"💵 Withdrew **{fmt(amount)}** to your wallet.\nWallet: {fmt(c2['cash'])} | Bank: {fmt(c2['bank'])}")
 
-    @commands.command()
+    @commands.command(aliases=["borrow"])
     async def loan(self, ctx, amount: float):
         """Apply for a personal loan. Interest rate based on credit score. Usage: !loan <amount>"""
         if not math.isfinite(amount) or amount <= 0:
@@ -112,7 +113,7 @@ class Banking(commands.Cog):
         log_tx(ctx.author.id, "loan_received", amount, f"Loan at {rate*100:.2f}% interest")
         await ctx.send(f"✅ Loan of **{fmt(amount)}** disbursed to your wallet. Repay with `!repay <amount>`.")
 
-    @commands.command()
+    @commands.command(aliases=["payloan"])
     async def repay(self, ctx, amount: float):
         """Repay an active loan from your wallet. Usage: !repay <amount>"""
         if not math.isfinite(amount) or amount <= 0:
@@ -153,7 +154,7 @@ class Banking(commands.Cog):
         log_tx(ctx.author.id, "loan_repayment", -actual, f"Loan repayment")
         await ctx.send(f"✅ Repaid **{fmt(actual)}**. {status_msg}")
 
-    @commands.command()
+    @commands.command(aliases=["loanlist"])
     async def loans(self, ctx):
         """View all your active loans."""
         ensure_citizen(ctx.author.id)
@@ -167,19 +168,28 @@ class Banking(commands.Cog):
             await ctx.send("You have no active loans. 🎉")
             return
 
-        embed = discord.Embed(title="📋 Active Loans", color=discord.Color.red())
-        for loan_id, principal, remaining, rate, weekly, issued in rows:
-            import datetime
-            issued_str = datetime.datetime.fromtimestamp(issued).strftime("%Y-%m-%d")
-            embed.add_field(
-                name=f"Loan #{loan_id} — {fmt(remaining)} remaining",
-                value=(
-                    f"Original: {fmt(principal)} | Rate: {rate*100:.2f}%\n"
-                    f"Weekly Payment: {fmt(weekly)} | Issued: {issued_str}"
-                ),
-                inline=False
-            )
-        await ctx.send(embed=embed)
+        import datetime
+        pages = []
+        chunk_size = 5
+        for idx in range(0, len(rows), chunk_size):
+            embed = discord.Embed(title="📋 Active Loans", color=discord.Color.red())
+            for loan_id, principal, remaining, rate, weekly, issued in rows[idx:idx + chunk_size]:
+                issued_str = datetime.datetime.fromtimestamp(issued).strftime("%Y-%m-%d")
+                embed.add_field(
+                    name=f"Loan #{loan_id} — {fmt(remaining)} remaining",
+                    value=(
+                        f"Original: {fmt(principal)} | Rate: {rate*100:.2f}%\n"
+                        f"Weekly Payment: {fmt(weekly)} | Issued: {issued_str}"
+                    ),
+                    inline=False
+                )
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
     @commands.command()
     async def credit(self, ctx):

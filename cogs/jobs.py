@@ -3,6 +3,7 @@ import random
 import discord
 from discord.ext import commands
 from db import cursor, conn
+from cogs.ui_components import PaginatorView
 from utils import (
     ensure_citizen, get_citizen, log_tx, fmt,
     calculate_income_tax, get_job_level,
@@ -74,7 +75,7 @@ class Jobs(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
+    @commands.command(aliases=["joblist", "careers"])
     async def jobs(self, ctx, category: str = None):
         """List all available jobs. Filter by: labor, skilled, professional, corporate, government, freelance"""
         cats = {}
@@ -87,18 +88,28 @@ class Jobs(commands.Cog):
             await ctx.send(f"No jobs found for category `{category}`.")
             return
 
-        embed = discord.Embed(title="💼 Job Listings", color=discord.Color.blue())
-        embed.description = "Use `!apply <job_id>` to apply for a job."
+        pages = []
         for cat, job_list in cats.items():
-            lines = []
-            for jid, j in job_list:
-                lines.append(
-                    f"`{jid}` — **{j['name']}** | Salary: {fmt(j['salary'][0])}–{fmt(j['salary'][1])} "
-                    f"| Skill Lv{j['skill']} | Edu: {j['edu'].title()}"
-                )
-            embed.add_field(name=f"📂 {cat}", value="\n".join(lines), inline=False)
-        embed.set_footer(text="Higher skill/education unlocks better-paying roles. Use !train and !educate to qualify.")
-        await ctx.send(embed=embed)
+            chunk_size = 6
+            for idx in range(0, len(job_list), chunk_size):
+                embed = discord.Embed(title=f"💼 Job Listings — {cat}", color=discord.Color.blue())
+                embed.description = "Use `!apply <job_id>` to apply for a job."
+                lines = []
+                for jid, j in job_list[idx:idx + chunk_size]:
+                    lines.append(
+                        f"`{jid}` — **{j['name']}** | Salary: {fmt(j['salary'][0])}–{fmt(j['salary'][1])} "
+                        f"| Skill Lv{j['skill']} | Edu: {j['edu'].title()}"
+                    )
+                embed.add_field(name="Open roles", value="\n".join(lines), inline=False)
+                embed.set_footer(text="Higher skill/education unlocks better-paying roles. Use !train and !educate.")
+                pages.append(embed)
+
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+            return
+        view = PaginatorView(ctx.author.id, pages)
+        msg = await ctx.send(embed=pages[0], view=view)
+        view.message = msg
 
     @commands.command()
     async def apply(self, ctx, job_id: str):
@@ -136,7 +147,7 @@ class Jobs(commands.Cog):
         conn.commit()
         await ctx.send(f"✅ You've been hired as a **{j['name']}**! Use `!work` to clock in for your first shift.")
 
-    @commands.command()
+    @commands.command(aliases=["quitjob"])
     async def resign(self, ctx):
         """Quit your current job."""
         ensure_citizen(ctx.author.id)
@@ -176,18 +187,20 @@ class Jobs(commands.Cog):
         inflation = safe_float(get_eco_state("inflation_rate") or 0.02, 0.02)
         consumer_conf = clamp(safe_float(get_eco_state("consumer_confidence") or 0.5, 0.5), 0.0, 1.0)
         phase = get_eco_state("economic_phase") or "stable"
+        money_mult = clamp(safe_float(get_eco_state("global_money_multiplier") or 1.0, 1.0), 0.1, 10.0)
+        xp_mult = clamp(safe_float(get_eco_state("global_xp_multiplier") or 1.0, 1.0), 0.1, 10.0)
 
         gross = random.uniform(j["salary"][0], j["salary"][1])
         # Balanced realism: inflation affects nominal wages modestly; confidence + phase affect hours/bonuses.
         nominal_adj = 1.0 + clamp(inflation, -0.05, 0.5) * 1.2
         phase_adj = {"boom": 1.08, "stable": 1.0, "recession": 0.92, "depression": 0.85}.get(phase, 1.0)
         conf_adj = 0.9 + consumer_conf * 0.2
-        gross *= multiplier * edu_bonus * nominal_adj * phase_adj * conf_adj
+        gross *= multiplier * edu_bonus * nominal_adj * phase_adj * conf_adj * money_mult
         gross = round(gross, 2)
 
         tax = calculate_income_tax(gross)
         net = round(gross - tax, 2)
-        new_xp = c["job_xp"] + 50
+        new_xp = c["job_xp"] + int(round(50 * xp_mult))
 
         cursor.execute(
             "UPDATE citizens SET bank = bank + ?, job_xp = ?, last_work = ? WHERE user_id = ?",
