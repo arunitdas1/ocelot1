@@ -14,6 +14,19 @@ if not MONGO_URI:
 _client = MongoClient(MONGO_URI, retryWrites=True)
 db = _client["ocelot"]
 
+# =========================
+# 🧪 MONGO CONNECTION CHECK (ADDED ONLY)
+# =========================
+def test_connection():
+    try:
+        result = _client.admin.command("ping")
+        print("✅ MongoDB PING SUCCESS:", result)
+        return True
+    except Exception as e:
+        print("❌ MongoDB CONNECTION FAILED:", e)
+        return False
+
+
 citizens = db["citizens"]
 businesses = db["businesses"]
 market_goods = db["market_goods"]
@@ -152,7 +165,6 @@ def _ensure_indexes():
     user_achievements.create_index([("user_id", ASCENDING), ("ach_key", ASCENDING)], unique=True)
     collections.create_index([("user_id", ASCENDING), ("collection_key", ASCENDING), ("item_key", ASCENDING)], unique=True)
     season_meta.create_index([("season_id", ASCENDING)], unique=True)
-    # Ensure there can only be one active season document.
     season_meta.create_index([("status", ASCENDING)], unique=True, partialFilterExpression={"status": "active"})
     season_stats.create_index([("season_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
     reminder_prefs.create_index([("user_id", ASCENDING)], unique=True)
@@ -306,7 +318,6 @@ def _seed_defaults():
                 }
             )
         except DuplicateKeyError:
-            # Another worker may have created the active season concurrently.
             pass
 
 
